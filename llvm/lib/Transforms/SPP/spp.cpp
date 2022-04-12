@@ -610,6 +610,47 @@ namespace {
             
             return true;
         }
+
+        bool instrumentAtomicOps(Instruction *I) 
+        {         
+            //checkbound and then cleantag for atomic ops   
+            IRBuilder<> B(I);
+            Value* Ptr = cast<AtomicRMWInst>(I)->getPointerOperand();
+            
+            assert(Ptr->getType()->isPointerTy()); 
+            
+            dbg(errs() << ">>"__func__ << "Ptr: " << *Ptr << " stripped: " \
+                        << *Ptr->stripPointerCasts() << "\n";)
+            
+            if (isa<GetElementPtrInst>(Ptr->stripPointerCasts())) 
+            {
+                assert(!isMissedGep(cast<GetElementPtrInst>(Ptr->stripPointerCasts()), I));
+            }
+
+            if (Ptr->getName().startswith("vtable") ||
+                Ptr->getName().startswith("vbase.offset") ||
+                Ptr->getName().startswith("vfn")) 
+            {
+                dbg(errs() << ">>Ignoring vbase/vtable/vfn atomic op boundcheck: " << *I << "\n";)
+                return false;
+            }
+            
+            Type *RetArgTy = Type::getInt8PtrTy(M->getContext());
+            SmallVector <Type*, 1> tlist;
+            tlist.push_back(RetArgTy);
+            FunctionType *hookfty = FunctionType::get(RetArgTy, RetArgTy, false);
+            FunctionCallee hook = M->getOrInsertFunction("__spp_checkbound", hookfty);
+
+            Value *TmpPtr = B.CreateBitCast(Ptr, hook.getFunctionType()->getParamType(0));
+            CallInst *Masked = B.CreateCall(hook, TmpPtr);
+            Value *NewPtr = B.CreatePointerCast(Masked, Ptr->getType());
+
+            int OpIdx = getOpIdx(I, Ptr);
+            I->setOperand(OpIdx, NewPtr);
+            dbg(errs() << ">> updated atomic op: " << *I << "\n";)
+            
+            return true;
+        }
         
         bool visitFunc(Function* F) 
         {
@@ -637,6 +678,10 @@ namespace {
                     if (isa<LoadInst>(Ins) || isa<StoreInst>(Ins)) 
                     {
                         changed = instrumentLoadOrStore(Ins);
+                    }
+                    if (isa<AtomicRMWInst>(Ins))
+                    {
+                        changed = instrumentAtomicOps(Ins);
                     }
                     else if (auto *Gep = dyn_cast<GetElementPtrInst>(Ins)) 
                     {
