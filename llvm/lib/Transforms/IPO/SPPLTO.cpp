@@ -359,8 +359,13 @@ SPPLTO::runOnModule(Module &M)
 
     if (!M.getFunction("main")) 
     {
-        dbg(errs() << "!>ALERT: No main found in module\n";)
-        return false; /// DON'T DELETE ME!!
+        errs() << "!>ALERT: No main found in module\n";
+        // for (auto curFref = M.getFunctionList().begin(), 
+        //     endFref = M.getFunctionList().end(); 
+        //     curFref != endFref; ++curFref) {
+        //     errs() << ">>Found function: " << curFref->getName() << "\n";
+        // }
+        // return false; /// DON'T DELETE ME!!
     }
      
     for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
