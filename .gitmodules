@@ -1,4 +1,4 @@
 [submodule "llvm/lib/Transforms/SPP/CustomOptimisation"]
 	path = llvm/lib/Transforms/SPP/CustomOptimisation
-	url = https://github.com/alexandrinapanfil/MIRROR_LLVMOptmisationForTaggedPtrs.gitt
+	url = https://github.com/alexandrinapanfil/MIRROR_LLVMOptmisationForTaggedPtrs.git
 	branch = spp_selfcontained
