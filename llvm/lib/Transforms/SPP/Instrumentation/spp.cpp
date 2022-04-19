@@ -75,7 +75,7 @@ namespace {
     class SPPPass {
 
         Module* M = nullptr;
-        TargetLibraryInfo* TLI = nullptr;
+        TargetLibraryInfoWrapperPass* TLIWP = nullptr;
         ScalarEvolution* SE = nullptr;
 
         const DataLayout *DL;
@@ -86,7 +86,11 @@ namespace {
         //TODO: Debuglist.
 
     public:
-        
+        std::unordered_set <Value*> globalPtrs;
+        std::unordered_set <Value*> volPtrs;
+        std::unordered_set <Value*> pmemPtrs;
+        std::unordered_set <Value*> extPtrs;
+
         std::vector<Instruction*> GEP_hooked_CBs;
         std::vector<Instruction*> GEP_skipped_CBs;
     
@@ -103,6 +107,16 @@ namespace {
         void setDL(const DataLayout *DL) 
         {
             this->DL = DL;
+        }
+
+        void setTLIWP(TargetLibraryInfoWrapperPass *TLIWP) 
+        {
+            this->TLIWP = TLIWP;
+        }
+
+        TargetLibraryInfo *getTLI(const Function & F)
+        {
+            return &this->TLIWP->getTLI(F);
         }
         
         void visitGlobals() 
@@ -206,6 +220,7 @@ namespace {
             {
                 return false;
             }
+            
             if (gep->hasAllZeroIndices()) 
             {
                return false;
@@ -282,7 +297,7 @@ namespace {
                     {
                         changed = instrGepOperand(Ins, GepOp);
                     }
-                } 
+                }
             }
             return changed;
         }
@@ -333,6 +348,13 @@ namespace {
             Value* Ptr = cast<PtrToIntInst>(I)->getPointerOperand();
             assert(Ptr->getType()->isPointerTy()); 
 
+            // if ( volPtrs.find(Ptr) != volPtrs.end() ||
+            //      globalPtrs.find(Ptr) != globalPtrs.end() )
+            // {
+            //     dbg(errs() << ">>global or volatile ptr skipped checkbound: " << *I << "\n";)
+            //     return false;
+            // }
+
             Type *RetArgTy = Type::getInt8PtrTy(M->getContext());
             SmallVector <Type*, 1> tlist;
             tlist.push_back(RetArgTy);
@@ -378,7 +400,14 @@ namespace {
                     continue;
                 }
                 
-                /// Now we got a Value arg. 
+                // Now we got a Value arg. 
+                if ( volPtrs.find(ArgVal) != volPtrs.end() ||
+                     globalPtrs.find(ArgVal) != globalPtrs.end() )
+                {
+                    dbg(errs() << ">>global or volatile ptr skipped cleaning: " << *CB << "\n";)
+                    continue;
+                }
+
                 if (ArgVal->getType()->isPointerTy() && 
                     ( CB->paramHasAttr(Arg - CB->arg_begin(), Attribute::ByVal) ||
                       CB->paramHasAttr(Arg - CB->arg_begin(), Attribute::StructRet) ))
@@ -428,26 +457,41 @@ namespace {
                 IRBuilder<> B(MCI);
                 std::vector <Value*> arglist;
 
-                Value *DestPtr = B.CreateBitCast(Dest, hook.getFunctionType()->getParamType(0));
-                Value *SrcPtr = B.CreateBitCast(Src, hook.getFunctionType()->getParamType(0));
                 Value *IntOff = B.CreateSExt(Length, hook.getFunctionType()->getParamType(1));
-                
-                std::vector<Value*> dest_args;
-                dest_args.push_back(DestPtr);
-                dest_args.push_back(IntOff);
-                CallInst *DestChecked = B.CreateCall(hook, dest_args);          
-                Value *DestCleaned = B.CreatePointerCast(DestChecked, Dest->getType());
 
-                std::vector<Value*> src_args;
-                src_args.push_back(SrcPtr);
-                src_args.push_back(IntOff);
-                CallInst *SrcChecked = B.CreateCall(hook, src_args);          
-                Value *SrcCleaned = B.CreatePointerCast(SrcChecked, Src->getType());
+                if ( volPtrs.find(Dest->stripPointerCasts()) != volPtrs.end() ||
+                    globalPtrs.find(Dest->stripPointerCasts()) != globalPtrs.end() )
+                {
+                    dbg(errs() << ">>" << __func__ << " global or volatile ptr Dest skipped: " << *MCI << "\n";)
+                }
+                else
+                {
+                    Value *DestPtr = B.CreateBitCast(Dest, hook.getFunctionType()->getParamType(0));
+                    std::vector<Value*> dest_args;
+                    dest_args.push_back(DestPtr);
+                    dest_args.push_back(IntOff);
+                    CallInst *DestChecked = B.CreateCall(hook, dest_args);          
+                    Value *DestCleaned = B.CreatePointerCast(DestChecked, Dest->getType());
+                    MCI->setDest(DestCleaned);
+                    changed = true;
+                }
 
-                MCI->setDest(DestCleaned);
-                MCI->setSource(SrcCleaned);          
-
-                changed = true;
+                if ( volPtrs.find(Src->stripPointerCasts()) != volPtrs.end() ||
+                    globalPtrs.find(Src->stripPointerCasts()) != globalPtrs.end() )
+                {
+                    dbg(errs() << ">>" << __func__ << " global or volatile ptr Src skipped: " << *MCI << "\n";)
+                }
+                else
+                {
+                    Value *SrcPtr = B.CreateBitCast(Src, hook.getFunctionType()->getParamType(0));
+                    std::vector<Value*> src_args;
+                    src_args.push_back(SrcPtr);
+                    src_args.push_back(IntOff);
+                    CallInst *SrcChecked = B.CreateCall(hook, src_args);          
+                    Value *SrcCleaned = B.CreatePointerCast(SrcChecked, Src->getType());
+                    MCI->setSource(SrcCleaned);
+                    changed = true;
+                }
             }
             else if (MemMoveInst *MMI = dyn_cast<MemMoveInst>(mi))
             {
@@ -528,9 +572,23 @@ namespace {
             /* TODO: we cannot support GEPs operating on vectors. */
             if (Gep->getType()->isVectorTy()) 
             {
-                errs() << ">>GEP:Warning: ignoring GEP on vector: " << *Gep << "\n";
+                dbg(errs() << ">>GEP:Warning: ignoring GEP on vector: " << *Gep << "\n";)
                 return false;
             }
+
+            if (globalPtrs.find(Gep->getPointerOperand()) != globalPtrs.end())
+            {
+                dbg(errs() << ">>global ptr skipped tag update: " << *Gep << "\n";)
+                globalPtrs.insert(Gep);
+                return false;
+            }            
+
+            if (volPtrs.find(Gep->getPointerOperand()) != volPtrs.end())
+            {
+                dbg(errs() << ">>volatile ptr skipped tag update: " << *Gep << "\n";)
+                volPtrs.insert(Gep);
+                return false;
+            }   
 
             //get the GEP offset
             Value *GepOff = EmitGEPOffset(&B, *DL, Gep);
@@ -578,12 +636,19 @@ namespace {
             
             assert(Ptr->getType()->isPointerTy()); 
             
-            dbg(errs() << ">>"__func__ << "Ptr: " << *Ptr << " stripped: " \
-                        << *Ptr->stripPointerCasts() << "\n";)
+            dbg(errs() << ">>" << __func__ << "Ptr: " << *Ptr << " stripped: " \
+                        << *Ptr->stripPointerCasts() << " type : " << *Ptr->stripPointerCasts()->getType() << "\n";)
             
             if (isa<GetElementPtrInst>(Ptr->stripPointerCasts())) 
             {
                 assert(!isMissedGep(cast<GetElementPtrInst>(Ptr->stripPointerCasts()), I));
+            }
+ 
+            if (isa<Constant>(Ptr->stripPointerCasts())) 
+            {
+                dbg(errs() << ">>" << __func__ << " constant skipping boundscheck: " \
+                        << *Ptr->stripPointerCasts() << "\n";)
+                return false;
             }
 
             if (Ptr->getName().startswith("vtable") ||
@@ -593,7 +658,14 @@ namespace {
                 dbg(errs() << ">>Ignoring vbase/vtable/vfn ld/st boundcheck: " << *I << "\n";)
                 return false;
             }
-            
+
+            if ( volPtrs.find(Ptr->stripPointerCasts()) != volPtrs.end() ||
+                 globalPtrs.find(Ptr->stripPointerCasts()) != globalPtrs.end() )
+            {
+                dbg(errs() << ">>" << __func__ << " global or volatile ptr skipped checkbound: " << *I << "\n";)
+                return false;
+            }
+
             Type *RetArgTy = Type::getInt8PtrTy(M->getContext());
             SmallVector <Type*, 1> tlist;
             tlist.push_back(RetArgTy);
@@ -627,6 +699,13 @@ namespace {
                 assert(!isMissedGep(cast<GetElementPtrInst>(Ptr->stripPointerCasts()), I));
             }
 
+            if (isa<Constant>(Ptr->stripPointerCasts())) 
+            {
+                dbg(errs() << ">>" << __func__ << " constant skipping boundscheck: " \
+                        << *Ptr->stripPointerCasts() << "\n";)
+                return false;
+            }
+
             if (Ptr->getName().startswith("vtable") ||
                 Ptr->getName().startswith("vbase.offset") ||
                 Ptr->getName().startswith("vfn")) 
@@ -635,6 +714,13 @@ namespace {
                 return false;
             }
             
+            if ( volPtrs.find(Ptr->stripPointerCasts()) != volPtrs.end() ||
+                 globalPtrs.find(Ptr->stripPointerCasts()) != globalPtrs.end() )
+            {
+                dbg(errs() << ">>" << __func__ << " global or volatile ptr skipped checkbound: " << *I << "\n";)
+                return false;
+            }
+
             Type *RetArgTy = Type::getInt8PtrTy(M->getContext());
             SmallVector <Type*, 1> tlist;
             tlist.push_back(RetArgTy);
@@ -712,6 +798,86 @@ namespace {
 
             return changed;
         }
+
+        bool trackPtrs(Function* F) 
+        {
+            for (auto BI= F->begin(); BI!= F->end(); ++BI) 
+            {
+                BasicBlock *BB = &*BI; 
+
+                for (auto II = BB->begin(); II != BB->end(); ++II) 
+                {    
+                    Instruction* Ins= &*II;
+
+                    if (isa<AllocaInst>(Ins)) 
+                    {
+                        volPtrs.insert(Ins);  
+                        dbg(errs()<<"Local: "<< *Ins <<"\n";)
+                        std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
+                        for (auto User : Users) 
+                        {
+                            Instruction *iUser= dyn_cast<Instruction>(User);
+                            dbg(errs() << ">>Local ptr use: " << *iUser << "\n";)
+
+                            // mark directly derived values as volatile:
+                            switch (iUser->getOpcode()) 
+                            {
+                                case Instruction::BitCast:
+                                case Instruction::PtrToInt:
+                                case Instruction::IntToPtr:
+                                case Instruction::GetElementPtr:
+                                    volPtrs.insert(iUser);
+                                default:
+                                    break;
+                            }                      
+                        }
+                    }
+                    else if (auto *CI = dyn_cast<CallInst>(Ins)) 
+                    { 
+                        Function* CalleeF = CI->getCalledFunction();
+                        if (!CalleeF) continue;
+
+                        //- Volatile Ptr -// 
+                        // if (isAllocationFn(CI, getTLI(*CalleeF), true)) {
+                        //     volPtrs.insert(Ins);
+                        //     errs()<<"Vol ptr: " << *Ins << "\n";
+                        // }
+                        if (isAllocLikeFn(CI, getTLI(*CalleeF)) ||
+                            isReallocLikeFn(CI, getTLI(*CalleeF))) 
+                        {
+                            volPtrs.insert(Ins);
+                            dbg(errs()<<"malloc/calloc/realloc ptr: " << *Ins << "\n";)
+
+                            std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
+                            for (auto User : Users) 
+                            {
+                                Instruction *iUser= dyn_cast<Instruction>(User);
+                                dbg(errs() << ">>vol ptr use: " << *iUser << "\n";)
+
+                                // mark directly derived values as volatile:
+                                switch (iUser->getOpcode()) 
+                                {
+                                    case Instruction::BitCast:
+                                    case Instruction::PtrToInt:
+                                    case Instruction::IntToPtr:
+                                    case Instruction::GetElementPtr:
+                                        volPtrs.insert(iUser);
+                                    default:
+                                        break;
+                                }  
+                            }
+                        }                        
+                        //- PM ptr -//
+                        else if (CalleeF->getName().contains("pmemobj_direct_inline")) {
+                            pmemPtrs.insert(Ins);
+                            dbg(errs()<<"PM ptr: "<<*Ins<<"\n";)
+                        }
+                    }
+                }
+            } //endof forloop
+
+            return false;
+        }
         
     };
     
@@ -721,6 +887,14 @@ namespace {
 
         SPPModule() : ModulePass(ID) { }
 
+        void getAnalysisUsage(AnalysisUsage &AU) const override{
+
+            // AU.addRequired<DominatorTreeWrapperPass>();
+            // AU.addRequired<AAResultsWrapperPass>(); 
+            // AU.addRequired<CallGraphWrapperPass>(); 
+            AU.addRequired<TargetLibraryInfoWrapperPass>();
+        }
+
         virtual bool runOnModule(Module& M) override
         {
             errs() << ">>Running_SPP_Module_Pass start...\n";
@@ -728,9 +902,35 @@ namespace {
             
             SPPPass Spp(&M);
             Spp.setDL(&M.getDataLayout()); //init the data layout
+            Spp.setTLIWP(&getAnalysis<TargetLibraryInfoWrapperPass>());
 
             bool changed = false;
            
+            //Track global ptrs
+            for (auto GV = M.global_begin(); GV!=M.global_end(); GV++) 
+            {
+                dbg(errs() << "Global found : " << *GV << "\n";)
+                Spp.globalPtrs.insert(&*GV);
+            }
+            
+            //Visit the functions to identify volatile ptrs and pm ptrs
+            for (auto F = M.begin(), Fend = M.end(); F != Fend; ++F) 
+            {                
+                if (F->isDeclaration()) 
+                {
+                    dbg(errs() << "External.. skipping\n";)
+                    continue; 
+                }
+                if (isSPPFuncName(F->getName()))
+                {
+                    dbg(errs() << "SPP hook func.. skipping\n";)
+                    continue; 
+                }
+
+                dbg(errs() << "Internal.. processing\n";)
+                changed = Spp.trackPtrs(&*F);
+            
+            }
             //Visit the functions to clear the appropriate ptr before external calls
             for (auto F = M.begin(), Fend = M.end(); F != Fend; ++F) 
             {
@@ -744,6 +944,12 @@ namespace {
                 if (isSPPFuncName(F->getName()))
                 {
                     dbg(errs() << "SPP hook func.. skipping\n";)
+                    continue; 
+                }
+
+                if (F->getName().contains("pmemobj_direct_inline"))
+                {
+                    dbg(errs() << "pmempobj direct inline func.. skipping\n";)
                     continue; 
                 }
 
