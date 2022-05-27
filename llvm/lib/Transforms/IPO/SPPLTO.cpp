@@ -157,13 +157,13 @@ static bool hasZeroRedundantChecks()
 
 static void eraseRedundantChecks() 
 { 
-    errs()<<">>ERASE_size: "<<redundantChecks.size()<<"\n";
+    // errs()<<">>ERASE_size: "<<redundantChecks.size()<<"\n";
     for (unsigned i=0; i < redundantChecks.size(); i++) {
         Instruction * eraseI = redundantChecks.at(i);
-        errs()<<i<<">>ERASE: "<< *eraseI <<"\n"; 
+        // errs()<<i<<">>ERASE: "<< *eraseI <<"\n"; 
         eraseI->eraseFromParent(); 
     }
-    errs()<<">>ERASE_done\n";
+    // errs()<<">>ERASE_done\n";
 }
         
 static void memCleanUp()
