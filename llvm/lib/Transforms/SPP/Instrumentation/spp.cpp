@@ -91,6 +91,8 @@ namespace {
         std::unordered_set <Value*> pmemPtrs;
         std::unordered_set <Value*> extPtrs;
 
+        std::unordered_set <Value*> checkedPtrs;
+
         std::vector<Instruction*> GEP_hooked_CBs;
         std::vector<Instruction*> GEP_skipped_CBs;
     
@@ -158,7 +160,18 @@ namespace {
             }
             return false;
         }
-        
+
+        bool isVolatileGep(GetElementPtrInst *Gep)
+        {
+            if ( volPtrs.find(Gep) != volPtrs.end() ||
+                globalPtrs.find(Gep) != globalPtrs.end() )
+            {
+                dbg(errs() << ">>" << __func__ << " global or volatile GEP skipped: " << *Gep << "\n";)
+                return true;
+            }
+            return false;
+        }
+
         bool isTagUpdated(GetElementPtrInst *Gep)
         {
             for (auto user = Gep->user_begin(); user != Gep->user_end(); ++user) 
@@ -201,6 +214,7 @@ namespace {
                 else if (&Iter == Op) 
                 {
                     //has to be found afterwards
+                    dbg(errs() << "Function : " << *F << " op : " << *Op << " userI : " << *userI << "\n";)
                     assert(found);
                     return true;
                 }
@@ -212,6 +226,11 @@ namespace {
         bool isMissedGep(GetElementPtrInst *gep, Instruction *userI)
         {
             if (isVtableGep(gep))
+            {
+                return false;
+            }
+
+            if (isVolatileGep(gep))
             {
                 return false;
             }
@@ -264,7 +283,6 @@ namespace {
         bool replaceFoldedGepOp(Instruction *Ins)
         {
             bool changed= false;
-
             for (auto Op = Ins->op_begin(); Op != Ins->op_end(); ++Op) 
             {
                 Instruction *MyOp= dyn_cast<Instruction>(Op);
@@ -281,7 +299,7 @@ namespace {
                 {
                     continue;
                 }
-
+                
                 GetElementPtrInst *GepOp= cast<GetElementPtrInst>(MyOp->stripPointerCasts()); 
 
                 if (isMissedGep(GepOp, Ins)) 
@@ -348,12 +366,12 @@ namespace {
             Value* Ptr = cast<PtrToIntInst>(I)->getPointerOperand();
             assert(Ptr->getType()->isPointerTy()); 
 
-            // if ( volPtrs.find(Ptr) != volPtrs.end() ||
-            //      globalPtrs.find(Ptr) != globalPtrs.end() )
-            // {
-            //     dbg(errs() << ">>global or volatile ptr skipped checkbound: " << *I << "\n";)
-            //     return false;
-            // }
+            if ( volPtrs.find(Ptr) != volPtrs.end() ||
+                 globalPtrs.find(Ptr) != globalPtrs.end() )
+            {
+                dbg(errs() << ">>global or volatile ptr skipped cleantag: " << *I << "\n";)
+                return false;
+            }
 
             Type *RetArgTy = Type::getInt8PtrTy(M->getContext());
             SmallVector <Type*, 1> tlist;
@@ -503,26 +521,41 @@ namespace {
                 IRBuilder<> B(MMI);
                 std::vector <Value*> arglist;
 
-                Value *DestPtr = B.CreateBitCast(Dest, hook.getFunctionType()->getParamType(0));
-                Value *SrcPtr = B.CreateBitCast(Src, hook.getFunctionType()->getParamType(0));
                 Value *IntOff = B.CreateSExt(Length, hook.getFunctionType()->getParamType(1));
                 
-                std::vector<Value*> dest_args;
-                dest_args.push_back(DestPtr);
-                dest_args.push_back(IntOff);
-                CallInst *DestChecked = B.CreateCall(hook, dest_args);          
-                Value *DestCleaned = B.CreatePointerCast(DestChecked, Dest->getType());
+                if ( volPtrs.find(Dest->stripPointerCasts()) != volPtrs.end() ||
+                    globalPtrs.find(Dest->stripPointerCasts()) != globalPtrs.end() )
+                {
+                    dbg(errs() << ">>" << __func__ << " global or volatile ptr Dest skipped: " << *MMI << "\n";)
+                }
+                else
+                {
+                    Value *DestPtr = B.CreateBitCast(Dest, hook.getFunctionType()->getParamType(0));
+                    std::vector<Value*> dest_args;
+                    dest_args.push_back(DestPtr);
+                    dest_args.push_back(IntOff);
+                    CallInst *DestChecked = B.CreateCall(hook, dest_args);          
+                    Value *DestCleaned = B.CreatePointerCast(DestChecked, Dest->getType());
+                    MMI->setDest(DestCleaned);
+                    changed = true;
+                }
 
-                std::vector<Value*> src_args;
-                src_args.push_back(SrcPtr);
-                src_args.push_back(IntOff);
-                CallInst *SrcChecked = B.CreateCall(hook, src_args);          
-                Value *SrcCleaned = B.CreatePointerCast(SrcChecked, Src->getType());
-
-                MMI->setDest(DestCleaned);
-                MMI->setSource(SrcCleaned);          
-
-                changed = true;
+                if ( volPtrs.find(Src->stripPointerCasts()) != volPtrs.end() ||
+                    globalPtrs.find(Src->stripPointerCasts()) != globalPtrs.end() )
+                {
+                    dbg(errs() << ">>" << __func__ << " global or volatile ptr Src skipped: " << *MMI << "\n";)
+                }
+                else
+                {
+                    Value *SrcPtr = B.CreateBitCast(Src, hook.getFunctionType()->getParamType(0));
+                    std::vector<Value*> src_args;
+                    src_args.push_back(SrcPtr);
+                    src_args.push_back(IntOff);
+                    CallInst *SrcChecked = B.CreateCall(hook, src_args);          
+                    Value *SrcCleaned = B.CreatePointerCast(SrcChecked, Src->getType());
+                    MMI->setSource(SrcCleaned);
+                    changed = true;
+                }
             }
             else if (MemSetInst *MSI = dyn_cast<MemSetInst>(mi))
             {
@@ -533,18 +566,24 @@ namespace {
                 IRBuilder<> B(MSI);
                 std::vector <Value*> arglist;
 
-                Value *DestPtr = B.CreateBitCast(Dest, hook.getFunctionType()->getParamType(0));
                 Value *IntOff = B.CreateSExt(Length, hook.getFunctionType()->getParamType(1));
-                
-                std::vector<Value*> dest_args;
-                dest_args.push_back(DestPtr);
-                dest_args.push_back(IntOff);
-                CallInst *DestChecked = B.CreateCall(hook, dest_args);          
-                Value *DestCleaned = B.CreatePointerCast(DestChecked, Dest->getType());
 
-                MSI->setDest(DestCleaned);       
-
-                changed = true;
+                if ( volPtrs.find(Dest->stripPointerCasts()) != volPtrs.end() ||
+                    globalPtrs.find(Dest->stripPointerCasts()) != globalPtrs.end() )
+                {
+                    dbg(errs() << ">>" << __func__ << " global or volatile ptr Dest skipped: " << *MSI << "\n";)
+                }
+                else
+                {
+                    Value *DestPtr = B.CreateBitCast(Dest, hook.getFunctionType()->getParamType(0));
+                    std::vector<Value*> dest_args;
+                    dest_args.push_back(DestPtr);
+                    dest_args.push_back(IntOff);
+                    CallInst *DestChecked = B.CreateCall(hook, dest_args);          
+                    Value *DestCleaned = B.CreatePointerCast(DestChecked, Dest->getType());
+                    MSI->setDest(DestCleaned);    
+                    changed = true;
+                }
             }
             return changed;
         }
@@ -659,6 +698,7 @@ namespace {
                 return false;
             }
 
+            //check for tag-free globals/volatile ptrs
             if ( volPtrs.find(Ptr->stripPointerCasts()) != volPtrs.end() ||
                  globalPtrs.find(Ptr->stripPointerCasts()) != globalPtrs.end() )
             {
@@ -666,11 +706,28 @@ namespace {
                 return false;
             }
 
+            //check for already checked ptrs
+            if ( checkedPtrs.find(Ptr->stripPointerCasts()) != checkedPtrs.end() )
+            {
+                errs() << ">>" << __func__ << " checked ptr skipped checkbound: " << *I << "\n";
+                return false;
+            }
+
             Type *RetArgTy = Type::getInt8PtrTy(M->getContext());
             SmallVector <Type*, 1> tlist;
             tlist.push_back(RetArgTy);
             FunctionType *hookfty = FunctionType::get(RetArgTy, RetArgTy, false);
-            FunctionCallee hook = M->getOrInsertFunction("__spp_checkbound", hookfty);
+
+            FunctionCallee hook;
+            if (pmemPtrs.find(Ptr->stripPointerCasts()) != pmemPtrs.end())
+            {
+                dbg(errs() << "__spp_checkbound_direct\n";)
+                hook = M->getOrInsertFunction("__spp_checkbound_direct", hookfty);
+            }
+            else 
+            {
+                hook = M->getOrInsertFunction("__spp_checkbound", hookfty);
+            }
 
             Value *TmpPtr = B.CreateBitCast(Ptr, hook.getFunctionType()->getParamType(0));
             CallInst *Masked = B.CreateCall(hook, TmpPtr);
@@ -680,6 +737,25 @@ namespace {
             I->setOperand(OpIdx, NewPtr);
             dbg(errs() << ">> updated ld/st: " << *I << "\n";)
             
+            //replace subsequent uses of the same ptr in ld/st instructions
+            checkedPtrs.insert(NewPtr);
+            for (auto user = Ptr->stripPointerCasts()->user_begin(); user != Ptr->stripPointerCasts()->user_end(); ++user) 
+            {
+                Instruction *userI = dyn_cast<Instruction>(user->stripPointerCasts());
+                if (userI && (userI != Ptr->stripPointerCasts()))
+                {
+                    if (isa<LoadInst>(userI) || isa<StoreInst>(userI) ||
+                        isa<AtomicRMWInst>(userI))
+                    {
+                        int OpIdx = getOpIdx(userI, Ptr);
+                        errs() << "Ptr : " << *Ptr->stripPointerCasts() << " use of checked ptr : " << *userI << " opIdx : " << OpIdx << "\n";
+                        // if (OpIdx > 0)
+                        // {
+                        //     userI->setOperand(OpIdx, NewPtr);
+                        // }
+                    }
+                }                
+            }
             return true;
         }
 
@@ -714,6 +790,7 @@ namespace {
                 return false;
             }
             
+            //check for tag-free globals/volatile ptrs
             if ( volPtrs.find(Ptr->stripPointerCasts()) != volPtrs.end() ||
                  globalPtrs.find(Ptr->stripPointerCasts()) != globalPtrs.end() )
             {
@@ -721,20 +798,55 @@ namespace {
                 return false;
             }
 
+            //check for already checked ptrs
+            if ( checkedPtrs.find(Ptr->stripPointerCasts()) != checkedPtrs.end() )
+            {
+                errs() << ">>" << __func__ << " checked ptr skipped checkbound: " << *I << "\n";
+                return false;
+            }
+
             Type *RetArgTy = Type::getInt8PtrTy(M->getContext());
             SmallVector <Type*, 1> tlist;
             tlist.push_back(RetArgTy);
             FunctionType *hookfty = FunctionType::get(RetArgTy, RetArgTy, false);
-            FunctionCallee hook = M->getOrInsertFunction("__spp_checkbound", hookfty);
+            FunctionCallee hook;
+            if (pmemPtrs.find(Ptr->stripPointerCasts()) != pmemPtrs.end())
+            {
+                dbg(errs() << "__spp_checkbound_direct\n";)
+                hook = M->getOrInsertFunction("__spp_checkbound_direct", hookfty);
+            }
+            else 
+            {
+                hook = M->getOrInsertFunction("__spp_checkbound", hookfty);
+            }
 
             Value *TmpPtr = B.CreateBitCast(Ptr, hook.getFunctionType()->getParamType(0));
             CallInst *Masked = B.CreateCall(hook, TmpPtr);
             Value *NewPtr = B.CreatePointerCast(Masked, Ptr->getType());
-
+            
             int OpIdx = getOpIdx(I, Ptr);
             I->setOperand(OpIdx, NewPtr);
             dbg(errs() << ">> updated atomic op: " << *I << "\n";)
-            
+
+            //replace subsequent uses of the same ptr in atomic and ld/st instructions
+            checkedPtrs.insert(NewPtr);
+            for (auto user = Ptr->user_begin(); user != Ptr->user_end(); ++user) 
+            {
+                Instruction *userI = dyn_cast<Instruction>(user->stripPointerCasts());
+                if (userI && (userI != Ptr->stripPointerCasts()))
+                {
+                    if (isa<LoadInst>(userI) || isa<StoreInst>(userI) ||
+                        isa<AtomicRMWInst>(userI))
+                    {
+                        int OpIdx = getOpIdx(userI, Ptr);
+                        errs() << "Ptr : " << *Ptr->stripPointerCasts() << " use of checked ptr : " << *userI << " opIdx : " << OpIdx << "\n";
+                        // if (OpIdx > 0)
+                        // {
+                        //     userI->setOperand(OpIdx, NewPtr);
+                        // }
+                    }
+                }                
+            }
             return true;
         }
         
@@ -868,9 +980,26 @@ namespace {
                             }
                         }                        
                         //- PM ptr -//
-                        else if (CalleeF->getName().contains("pmemobj_direct_inline")) {
+                        else if (CalleeF->getName().contains("pmemobj_direct")) 
+                        {
                             pmemPtrs.insert(Ins);
                             dbg(errs()<<"PM ptr: "<<*Ins<<"\n";)
+                            std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
+                            for (auto User : Users) 
+                            {
+                                Instruction *iUser= dyn_cast<Instruction>(User);
+                                dbg(errs() << ">>pm ptr use: " << *iUser << "\n";)
+
+                                // mark directly derived values as volatile:
+                                switch (iUser->getOpcode()) 
+                                {
+                                    case Instruction::BitCast:
+                                    case Instruction::GetElementPtr:
+                                        pmemPtrs.insert(iUser);
+                                    default:
+                                        break;
+                                }  
+                            }
                         }
                     }
                 }
@@ -947,9 +1076,9 @@ namespace {
                     continue; 
                 }
 
-                if (F->getName().contains("pmemobj_direct_inline"))
+                if (F->getName().contains("pmemobj_direct"))
                 {
-                    dbg(errs() << "pmempobj direct inline func.. skipping\n";)
+                    dbg(errs() << "pmempobj direct func.. skipping\n";)
                     continue; 
                 }
 
