@@ -20,6 +20,7 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/LegacyPassManager.h>
+#include <llvm/IR/Verifier.h>
 #include <llvm/Support/Casting.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/ADT/DepthFirstIterator.h>
@@ -91,6 +92,8 @@ namespace {
         std::unordered_set <Value*> pmemPtrs;
         std::unordered_set <Value*> extPtrs;
 
+        std::unordered_set <Value*> vtPtrs;
+        std::unordered_set <Value*> cxaPtrs;
         std::unordered_set <Value*> checkedPtrs;
 
         std::vector<Instruction*> GEP_hooked_CBs;
@@ -164,7 +167,8 @@ namespace {
         bool isVolatileGep(GetElementPtrInst *Gep)
         {
             if ( volPtrs.find(Gep) != volPtrs.end() ||
-                globalPtrs.find(Gep) != globalPtrs.end() )
+                globalPtrs.find(Gep) != globalPtrs.end() ||
+                vtPtrs.find(Gep) != vtPtrs.end() )
             {
                 dbg(errs() << ">>" << __func__ << " global or volatile GEP skipped: " << *Gep << "\n";)
                 return true;
@@ -294,7 +298,6 @@ namespace {
                 dbg(errs() << ">>" << __func__ << " folded op: " << **Op << "\n";) 
                 
                 // only one-depth for now.. 
-                // otherwise we are screwed.
                 if (!isa<GetElementPtrInst>(MyOp->stripPointerCasts())) 
                 {
                     continue;
@@ -366,8 +369,9 @@ namespace {
             Value* Ptr = cast<PtrToIntInst>(I)->getPointerOperand();
             assert(Ptr->getType()->isPointerTy()); 
 
-            if ( volPtrs.find(Ptr) != volPtrs.end() ||
-                 globalPtrs.find(Ptr) != globalPtrs.end() )
+            if ( volPtrs.find(Ptr->stripPointerCasts()) != volPtrs.end() ||
+                 globalPtrs.find(Ptr->stripPointerCasts()) != globalPtrs.end() ||
+                 vtPtrs.find(Ptr->stripPointerCasts()) != vtPtrs.end() )
             {
                 dbg(errs() << ">>global or volatile ptr skipped cleantag: " << *I << "\n";)
                 return false;
@@ -419,11 +423,15 @@ namespace {
                 }
                 
                 // Now we got a Value arg. 
-                if ( volPtrs.find(ArgVal) != volPtrs.end() ||
-                     globalPtrs.find(ArgVal) != globalPtrs.end() )
+                if (ArgVal->getType()->isPointerTy())
                 {
-                    dbg(errs() << ">>global or volatile ptr skipped cleaning: " << *CB << "\n";)
-                    continue;
+                    if ( volPtrs.find(ArgVal->stripPointerCasts()) != volPtrs.end() ||
+                        globalPtrs.find(ArgVal->stripPointerCasts()) != globalPtrs.end() ||
+                        vtPtrs.find(ArgVal->stripPointerCasts()) != vtPtrs.end() )
+                    {
+                        dbg(errs() << ">>global, volatile or vtable ptr skipped cleaning: " << *CB << "\n";)
+                        continue;
+                    }
                 }
 
                 if (ArgVal->getType()->isPointerTy() && 
@@ -478,7 +486,8 @@ namespace {
                 Value *IntOff = B.CreateSExt(Length, hook.getFunctionType()->getParamType(1));
 
                 if ( volPtrs.find(Dest->stripPointerCasts()) != volPtrs.end() ||
-                    globalPtrs.find(Dest->stripPointerCasts()) != globalPtrs.end() )
+                    globalPtrs.find(Dest->stripPointerCasts()) != globalPtrs.end() ||
+                    vtPtrs.find(Dest->stripPointerCasts()) != vtPtrs.end() )
                 {
                     dbg(errs() << ">>" << __func__ << " global or volatile ptr Dest skipped: " << *MCI << "\n";)
                 }
@@ -495,7 +504,8 @@ namespace {
                 }
 
                 if ( volPtrs.find(Src->stripPointerCasts()) != volPtrs.end() ||
-                    globalPtrs.find(Src->stripPointerCasts()) != globalPtrs.end() )
+                    globalPtrs.find(Src->stripPointerCasts()) != globalPtrs.end() ||
+                    vtPtrs.find(Src->stripPointerCasts()) != vtPtrs.end() )
                 {
                     dbg(errs() << ">>" << __func__ << " global or volatile ptr Src skipped: " << *MCI << "\n";)
                 }
@@ -524,7 +534,8 @@ namespace {
                 Value *IntOff = B.CreateSExt(Length, hook.getFunctionType()->getParamType(1));
                 
                 if ( volPtrs.find(Dest->stripPointerCasts()) != volPtrs.end() ||
-                    globalPtrs.find(Dest->stripPointerCasts()) != globalPtrs.end() )
+                    globalPtrs.find(Dest->stripPointerCasts()) != globalPtrs.end() ||
+                    vtPtrs.find(Dest->stripPointerCasts()) != vtPtrs.end() )
                 {
                     dbg(errs() << ">>" << __func__ << " global or volatile ptr Dest skipped: " << *MMI << "\n";)
                 }
@@ -541,7 +552,8 @@ namespace {
                 }
 
                 if ( volPtrs.find(Src->stripPointerCasts()) != volPtrs.end() ||
-                    globalPtrs.find(Src->stripPointerCasts()) != globalPtrs.end() )
+                    globalPtrs.find(Src->stripPointerCasts()) != globalPtrs.end() ||
+                    vtPtrs.find(Src->stripPointerCasts()) != vtPtrs.end() )
                 {
                     dbg(errs() << ">>" << __func__ << " global or volatile ptr Src skipped: " << *MMI << "\n";)
                 }
@@ -569,7 +581,8 @@ namespace {
                 Value *IntOff = B.CreateSExt(Length, hook.getFunctionType()->getParamType(1));
 
                 if ( volPtrs.find(Dest->stripPointerCasts()) != volPtrs.end() ||
-                    globalPtrs.find(Dest->stripPointerCasts()) != globalPtrs.end() )
+                    globalPtrs.find(Dest->stripPointerCasts()) != globalPtrs.end() ||
+                    vtPtrs.find(Dest->stripPointerCasts()) != vtPtrs.end() )
                 {
                     dbg(errs() << ">>" << __func__ << " global or volatile ptr Dest skipped: " << *MSI << "\n";)
                 }
@@ -615,16 +628,23 @@ namespace {
                 return false;
             }
 
-            if (globalPtrs.find(Gep->getPointerOperand()) != globalPtrs.end())
+            if (globalPtrs.find(Gep->getPointerOperand()->stripPointerCasts()) != globalPtrs.end())
             {
                 dbg(errs() << ">>global ptr skipped tag update: " << *Gep << "\n";)
                 globalPtrs.insert(Gep);
                 return false;
             }            
 
-            if (volPtrs.find(Gep->getPointerOperand()) != volPtrs.end())
+            if (volPtrs.find(Gep->getPointerOperand()->stripPointerCasts()) != volPtrs.end())
             {
                 dbg(errs() << ">>volatile ptr skipped tag update: " << *Gep << "\n";)
+                volPtrs.insert(Gep);
+                return false;
+            }   
+
+            if (vtPtrs.find(Gep->getPointerOperand()->stripPointerCasts()) != vtPtrs.end())
+            {
+                dbg(errs() << ">>vtable ptr skipped tag update: " << *Gep << "\n";)
                 volPtrs.insert(Gep);
                 return false;
             }   
@@ -698,18 +718,27 @@ namespace {
                 return false;
             }
 
+            if (I->getName().startswith("vtable") ||
+                I->getName().startswith("vbase.offset") ||
+                I->getName().startswith("vfn")) 
+            {
+                dbg(errs() << ">>Ignoring vbase/vtable/vfn variables assignment boundcheck: " << *I << "\n";)
+                return false;
+            }
+
             //check for tag-free globals/volatile ptrs
             if ( volPtrs.find(Ptr->stripPointerCasts()) != volPtrs.end() ||
-                 globalPtrs.find(Ptr->stripPointerCasts()) != globalPtrs.end() )
+                 globalPtrs.find(Ptr->stripPointerCasts()) != globalPtrs.end() ||
+                 vtPtrs.find(Ptr->stripPointerCasts()) != vtPtrs.end() )
             {
                 dbg(errs() << ">>" << __func__ << " global or volatile ptr skipped checkbound: " << *I << "\n";)
                 return false;
             }
 
             //check for already checked ptrs
-            if ( checkedPtrs.find(Ptr->stripPointerCasts()) != checkedPtrs.end() )
+            if ( checkedPtrs.find(Ptr) != checkedPtrs.end() )
             {
-                errs() << ">>" << __func__ << " checked ptr skipped checkbound: " << *I << "\n";
+                dbg(errs() << ">>" << __func__ << " checked ptr skipped checkbound: " << *I << "\n";)
                 return false;
             }
 
@@ -717,11 +746,11 @@ namespace {
             SmallVector <Type*, 1> tlist;
             tlist.push_back(RetArgTy);
             FunctionType *hookfty = FunctionType::get(RetArgTy, RetArgTy, false);
-
             FunctionCallee hook;
+
             if (pmemPtrs.find(Ptr->stripPointerCasts()) != pmemPtrs.end())
             {
-                dbg(errs() << "__spp_checkbound_direct\n";)
+                errs() << ">> Inserted __spp_checkbound_direct\n";
                 hook = M->getOrInsertFunction("__spp_checkbound_direct", hookfty);
             }
             else 
@@ -733,29 +762,60 @@ namespace {
             CallInst *Masked = B.CreateCall(hook, TmpPtr);
             Value *NewPtr = B.CreatePointerCast(Masked, Ptr->getType());
 
+            dbg(errs() << ">> old ld/st: " << *I << " ptr: " << *Ptr << " stripped: " << *Ptr->stripPointerCasts() << "\n";)
             int OpIdx = getOpIdx(I, Ptr);
             I->setOperand(OpIdx, NewPtr);
-            dbg(errs() << ">> updated ld/st: " << *I << "\n";)
+            dbg(errs() << ">> updated ld/st: " << *I << " ptr: " << *NewPtr << " stripped: " << *NewPtr->stripPointerCasts() << "\n";)
             
-            //replace subsequent uses of the same ptr in ld/st instructions
+            //replace subsequent uses of the same ptr in ld/st/atomic instructions
             checkedPtrs.insert(NewPtr);
-            for (auto user = Ptr->stripPointerCasts()->user_begin(); user != Ptr->stripPointerCasts()->user_end(); ++user) 
-            {
-                Instruction *userI = dyn_cast<Instruction>(user->stripPointerCasts());
-                if (userI && (userI != Ptr->stripPointerCasts()))
-                {
-                    if (isa<LoadInst>(userI) || isa<StoreInst>(userI) ||
-                        isa<AtomicRMWInst>(userI))
+            // checkedPtrs.insert(Ptr);
+            
+            dbg(errs() << "old ptr: " << *Ptr << " stripped: " << *Ptr->stripPointerCasts() << "\n";)
+            dbg(errs() << "new ptr: " << *NewPtr << " stripped: " << *NewPtr->stripPointerCasts() << "\n";)
+            /* replace these */
+            DenseMap<Instruction*, int> replaceChecked;
+            for(auto U : Ptr->users()){  // U is of type User*
+                if (auto userI = dyn_cast<Instruction>(U)){
+
+                    if (userI->getParent() == I->getParent() &&
+                        userI->comesBefore(I))
                     {
-                        int OpIdx = getOpIdx(userI, Ptr);
-                        errs() << "Ptr : " << *Ptr->stripPointerCasts() << " use of checked ptr : " << *userI << " opIdx : " << OpIdx << "\n";
-                        // if (OpIdx > 0)
-                        // {
-                        //     userI->setOperand(OpIdx, NewPtr);
-                        // }
+                        dbg(errs() << "Earlier use of old ptr: " << *userI << "\n";)
+                        continue;
                     }
-                }                
+                    // an instruction uses V
+                    dbg(errs() << "Use of old ptr: " << *userI << "\n";)
+                    if (isa<LoadInst>(userI) || isa<StoreInst>(userI) ||
+                        isa<AtomicRMWInst>(userI) || isa<BitCastInst>(userI) ||
+                            isa<CallInst>(userI) || isa<InvokeInst>(userI))
+                        {
+                            int OpIdx = getOpIdx(userI, Ptr);
+                            if (OpIdx >= 0)
+                            {
+                                replaceChecked[userI] = OpIdx;
+                            }
+                        }
+                    }
+                }
+
+            DominatorTree DT = DominatorTree(*I->getFunction());
+            for (auto it : replaceChecked)
+            {
+                Instruction* I = it.first;
+                int OpIdx = it.second;
+                dbg(errs() << "Instr without replacement: " << *I << "\n";)
+                I->setOperand(OpIdx, NewPtr);
+                dbg(errs() << "Instr with replacement: " << *I << " idx : " << OpIdx<<"\n";)
+                
+                if (!DT.dominates(NewPtr, I))
+                {
+                    I->setOperand(OpIdx, Ptr);
+                    dbg(errs() << "Non-dominated -- revert back to: " << *I << "\n";)
+                }
             }
+            replaceChecked.clear();
+
             return true;
         }
 
@@ -789,19 +849,28 @@ namespace {
                 dbg(errs() << ">>Ignoring vbase/vtable/vfn atomic op boundcheck: " << *I << "\n";)
                 return false;
             }
+
+            if (I->getName().startswith("vtable") ||
+                I->getName().startswith("vbase.offset") ||
+                I->getName().startswith("vfn")) 
+            {
+                dbg(errs() << ">>Ignoring vbase/vtable/vfn variables assignment boundcheck: " << *I << "\n";)
+                return false;
+            }
             
             //check for tag-free globals/volatile ptrs
             if ( volPtrs.find(Ptr->stripPointerCasts()) != volPtrs.end() ||
-                 globalPtrs.find(Ptr->stripPointerCasts()) != globalPtrs.end() )
+                 globalPtrs.find(Ptr->stripPointerCasts()) != globalPtrs.end() ||
+                 vtPtrs.find(Ptr->stripPointerCasts()) != vtPtrs.end() )
             {
                 dbg(errs() << ">>" << __func__ << " global or volatile ptr skipped checkbound: " << *I << "\n";)
                 return false;
             }
 
             //check for already checked ptrs
-            if ( checkedPtrs.find(Ptr->stripPointerCasts()) != checkedPtrs.end() )
+            if ( checkedPtrs.find(Ptr) != checkedPtrs.end() )
             {
-                errs() << ">>" << __func__ << " checked ptr skipped checkbound: " << *I << "\n";
+                dbg(errs() << ">>" << __func__ << " checked ptr skipped checkbound: " << *I << "\n";)
                 return false;
             }
 
@@ -828,25 +897,56 @@ namespace {
             I->setOperand(OpIdx, NewPtr);
             dbg(errs() << ">> updated atomic op: " << *I << "\n";)
 
-            //replace subsequent uses of the same ptr in atomic and ld/st instructions
+            //replace subsequent uses of the same ptr in ld/st/atomic instructions
             checkedPtrs.insert(NewPtr);
-            for (auto user = Ptr->user_begin(); user != Ptr->user_end(); ++user) 
-            {
-                Instruction *userI = dyn_cast<Instruction>(user->stripPointerCasts());
-                if (userI && (userI != Ptr->stripPointerCasts()))
-                {
+            checkedPtrs.insert(Ptr);
+            
+            dbg(errs() << "old ptr: " << *Ptr << " stripped: " << *Ptr->stripPointerCasts() << "\n";)
+            dbg(errs() << "new ptr: " << *NewPtr << " stripped: " << *NewPtr->stripPointerCasts() << "\n";)
+
+            /* replace these */
+            DenseMap<Instruction*, int> replaceChecked;
+            for(auto U : Ptr->users()){  // U is of type User*
+                if (auto userI = dyn_cast<Instruction>(U)){
+
+                    if (userI->getParent() == I->getParent() &&
+                        userI->comesBefore(I))
+                    {
+                        dbg(errs() << "Earlier use of old ptr: " << *userI << "\n";)
+                        continue;
+                    }
+                    // an instruction uses V
+                    dbg(errs() << "Use of old ptr: " << *userI << "\n";)
                     if (isa<LoadInst>(userI) || isa<StoreInst>(userI) ||
-                        isa<AtomicRMWInst>(userI))
+                        isa<AtomicRMWInst>(userI) || isa<BitCastInst>(userI) ||
+                        isa<CallInst>(userI) || isa<InvokeInst>(userI))
                     {
                         int OpIdx = getOpIdx(userI, Ptr);
-                        errs() << "Ptr : " << *Ptr->stripPointerCasts() << " use of checked ptr : " << *userI << " opIdx : " << OpIdx << "\n";
-                        // if (OpIdx > 0)
-                        // {
-                        //     userI->setOperand(OpIdx, NewPtr);
-                        // }
+                        if (OpIdx >= 0)
+                        {
+                            replaceChecked[userI] = OpIdx;
+                        }
                     }
-                }                
+                }
             }
+            
+            DominatorTree DT = DominatorTree(*I->getFunction());
+            for (auto it : replaceChecked)
+            {
+                Instruction* I = it.first;
+                int OpIdx = it.second;
+                dbg(errs() << "Instr without replacement: " << *I << "\n";)
+                I->setOperand(OpIdx, NewPtr);
+                dbg(errs() << "Instr with replacement: " << *I << " idx : " << OpIdx<<"\n";)
+                
+                if (!DT.dominates(NewPtr, I))
+                {
+                    I->setOperand(OpIdx, Ptr);
+                    dbg(errs() << "Non-dominated -- revert back to: " << *I << "\n";)
+                }
+            }
+            replaceChecked.clear();
+
             return true;
         }
         
@@ -854,7 +954,7 @@ namespace {
         {
             bool changed = false;
 
-            for (auto BI= F->begin(); BI!= F->end(); ++BI) 
+            for (auto BI = F->begin(); BI != F->end(); ++BI) 
             {
                 BasicBlock *BB = &*BI; 
                 Instruction *sucInst = &*(BB->begin());
@@ -896,6 +996,7 @@ namespace {
                     else if (isa<PtrToIntInst>(Ins))
                     {
                         /* Clean the tag for now */
+                        /* remove them from checking possibly? */
                         dbg(errs() << ">>LLVM PtrToInt call: " << *Ins << " cleaning..\n";)
                         changed = instrPtrToInt(Ins);
                     }
@@ -920,7 +1021,7 @@ namespace {
                 for (auto II = BB->begin(); II != BB->end(); ++II) 
                 {    
                     Instruction* Ins= &*II;
-
+                    /* Stack variables*/
                     if (isa<AllocaInst>(Ins)) 
                     {
                         volPtrs.insert(Ins);  
@@ -949,13 +1050,11 @@ namespace {
                         Function* CalleeF = CI->getCalledFunction();
                         if (!CalleeF) continue;
 
-                        //- Volatile Ptr -// 
-                        // if (isAllocationFn(CI, getTLI(*CalleeF), true)) {
-                        //     volPtrs.insert(Ins);
-                        //     errs()<<"Vol ptr: " << *Ins << "\n";
-                        // }
+                        /* Volatile Ptrs */
                         if (isAllocLikeFn(CI, getTLI(*CalleeF)) ||
-                            isReallocLikeFn(CI, getTLI(*CalleeF))) 
+                            isReallocLikeFn(CI, getTLI(*CalleeF)) ||
+                            CalleeF->getName().contains("__errno_location") ||
+                            CalleeF->getName().contains("__cxa")) 
                         {
                             volPtrs.insert(Ins);
                             dbg(errs()<<"malloc/calloc/realloc ptr: " << *Ins << "\n";)
@@ -979,11 +1078,11 @@ namespace {
                                 }  
                             }
                         }                        
-                        //- PM ptr -//
+                        /* PM Ptrs */
                         else if (CalleeF->getName().contains("pmemobj_direct")) 
                         {
                             pmemPtrs.insert(Ins);
-                            dbg(errs()<<"PM ptr: "<<*Ins<<"\n";)
+                            errs()<<"PM ptr: "<<*Ins<<"\n";
                             std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
                             for (auto User : Users) 
                             {
@@ -1002,9 +1101,33 @@ namespace {
                             }
                         }
                     }
+                    /* vtable,vbase and vfn variables */
+                    else if (Ins->getName().startswith("vbase.offset") ||
+                            Ins->getName().startswith("vfn") ||
+                            Ins->getName().startswith("vtable"))
+                    {
+                        vtPtrs.insert(Ins);
+                        dbg(errs()<<"Vtable ptr: "<<*Ins<<"\n";)
+                        std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
+                        for (auto User : Users) 
+                        {
+                            Instruction *iUser= dyn_cast<Instruction>(User);
+                            dbg(errs() << ">>Virtual ptr use: " << *iUser << "\n";)
+                            // mark directly derived values as volatile:
+                            switch (iUser->getOpcode()) 
+                            {
+                                case Instruction::BitCast:
+                                case Instruction::PtrToInt:
+                                case Instruction::IntToPtr:
+                                case Instruction::GetElementPtr:
+                                    vtPtrs.insert(iUser);
+                                default:
+                                    break;
+                            }  
+                        }
+                    }
                 }
-            } //endof forloop
-
+            }
             return false;
         }
         
@@ -1035,6 +1158,21 @@ namespace {
 
             bool changed = false;
            
+            // for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+            // {
+            //     for (auto BB = Fn->begin(); BB != Fn->end(); ++BB) 
+            //     {
+            //         BasicBlock *BaB = &*BB; 
+            //         if (BaB == &BaB->getParent()->getEntryBlock())
+            //             errs() << *Fn <<"\n";
+            //         errs() << *BB << "\n";
+            //         // for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
+            //         // {
+            //         //     errs() << *ins << "\n";
+            //         // }
+            //     }
+            // }
+
             //Track global ptrs
             for (auto GV = M.global_begin(); GV!=M.global_end(); GV++) 
             {
@@ -1042,7 +1180,7 @@ namespace {
                 Spp.globalPtrs.insert(&*GV);
             }
             
-            //Visit the functions to identify volatile ptrs and pm ptrs
+            //Visit the functions to identify volatile ptrs, pm and vtable ptrs
             for (auto F = M.begin(), Fend = M.end(); F != Fend; ++F) 
             {                
                 if (F->isDeclaration()) 
@@ -1088,6 +1226,22 @@ namespace {
             }
             
             errs() << ">>Running_SPP_Module_Pass exiting...\n";
+
+            // for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+            // {
+            //     for (auto BB = Fn->begin(); BB != Fn->end(); ++BB) 
+            //     {
+            //         BasicBlock *BaB = &*BB; 
+            //         if (BaB == &BaB->getParent()->getEntryBlock())
+            //             errs() << *Fn <<"\n";
+            //         errs() << *BB << "\n";
+            //         // for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
+            //         // {
+            //         //     errs() << *ins << "\n";
+            //         // }
+            //     }
+            // }
+
             return changed;
         }
         
@@ -1100,6 +1254,7 @@ namespace {
                          legacy::PassManagerBase &PM) 
     {
         PM.add(new SPPModule());
+        // PM.add(new VerifierPass());
     }
     //apply the module pass at this phase because EarlyAsPossible can cause UB
     static RegisterStandardPasses
