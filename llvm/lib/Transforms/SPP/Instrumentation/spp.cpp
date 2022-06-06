@@ -124,6 +124,17 @@ namespace {
             return &this->TLIWP->getTLI(F);
         }
         
+        void memCleanUp()
+        {
+            this->globalPtrs.clear();
+            this->volPtrs.clear();
+            this->pmemPtrs.clear();
+            this->extPtrs.clear();
+            this->vtPtrs.clear();
+            this->cxaPtrs.clear();
+            this->checkedPtrs.clear();
+        }
+        
         void visitGlobals() 
         {
             SmallVector<GlobalVariable*, 16> globals;
@@ -1241,7 +1252,7 @@ namespace {
             //         // }
             //     }
             // }
-
+            Spp.memCleanUp();
             return changed;
         }
         
