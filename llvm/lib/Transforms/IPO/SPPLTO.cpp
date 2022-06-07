@@ -88,7 +88,6 @@ struct SPPLTO : public ModulePass {
   bool doCallBase (CallBase * ins);
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
-
     //AU.addRequired<DominatorTreeWrapperPass>();
     //AU.addRequired<AAResultsWrapperPass>();
     //AU.addRequired<CallGraphWrapperPass>();
@@ -116,6 +115,7 @@ static std::unordered_set <Value*> globalPtrs;
 static std::unordered_set <Value*> volPtrs;
 static std::unordered_set <Value*> pmemPtrs;
 static std::unordered_set <Value*> extPtrs;
+static std::unordered_set <Value*> vtPtrs;
 
 static std::vector<Instruction*> redundantChecks;
 
@@ -137,7 +137,7 @@ SPPLTOPass::run(Module &M, ModuleAnalysisManager &MAM)
 static string 
 demangleName(StringRef str)
 {
-    string result= "";
+    string result = "";
     int unmangledStatus;
     
     char *unmangledName = abi::__cxa_demangle(
@@ -145,7 +145,7 @@ demangleName(StringRef str)
     if (unmangledStatus == 0) 
     {
         string unmangledNameStr(unmangledName);
-        result= unmangledNameStr;
+        result = unmangledNameStr;
     }
     return result;    
 }
@@ -157,13 +157,13 @@ static bool hasZeroRedundantChecks()
 
 static void eraseRedundantChecks() 
 { 
-    // errs()<<">>ERASE_size: "<<redundantChecks.size()<<"\n";
+    dbg(errs()<<">>ERASE_size: "<<redundantChecks.size()<<"\n";)
     for (unsigned i=0; i < redundantChecks.size(); i++) {
         Instruction * eraseI = redundantChecks.at(i);
-        // errs()<<i<<">>ERASE: "<< *eraseI <<"\n"; 
+        dbg(errs()<<i<<">>ERASE: "<< *eraseI <<"\n";)
         eraseI->eraseFromParent(); 
     }
-    // errs()<<">>ERASE_done\n";
+    dbg(errs()<<">>ERASE_done\n";)
 }
         
 static void memCleanUp()
@@ -173,6 +173,7 @@ static void memCleanUp()
     globalPtrs.clear();
     pmemPtrs.clear();
     extPtrs.clear();
+    vtPtrs.clear();
 }
 
 static bool
@@ -289,6 +290,7 @@ doCallExternal(CallBase *CB)
         } 
 
         if ( volPtrs.find(ArgVal) != volPtrs.end() ||
+             vtPtrs.find(ArgVal) != vtPtrs.end() ||
              globalPtrs.find(ArgVal) != globalPtrs.end() ||
              extPtrs.find(ArgVal) != extPtrs.end() )
         {
@@ -340,12 +342,11 @@ doCallFunction(CallBase *cb, Function *cfn)
         return false;
     }
     
-    // if (cfn->getName().startswith("llvm.dbg.") && 
-    //     !cfn->getName().startswith("llvm.dbg.label") &&
-    //     !cfn->getName().startswith("llvm.dbg.value")) 
-    // {
-    //     return doCallFunc_LLVMDbg(cb); 
-    // }
+    // Ignore exception handling calls
+    if (cfn->getName().startswith("__cxa_"))
+    {
+        return false;
+    }
 
     if (cfn->isDeclaration() ||
         StringRef(demangleName(cfn->getName())).equals("pmemobj_direct_inline") ||
@@ -446,15 +447,13 @@ SPPLTO::trackPtrs(Function* F)
                 if (!CalleeF) continue;
 
                 //- Volatile Ptr -// 
-                // if (isAllocationFn(CI, getTLI(*CalleeF), true)) {
-                //     volPtrs.insert(Ins);
-                //     errs()<<"Vol ptr: " << *Ins << "\n";
-                // }
                 if (isAllocLikeFn(CI, getTLI(*CalleeF)) ||
-                    isReallocLikeFn(CI, getTLI(*CalleeF))) 
+                    isReallocLikeFn(CI, getTLI(*CalleeF)) ||
+                    CalleeF->getName().contains("__errno_location") ||
+                    CalleeF->getName().startswith("__cxa_")) 
                 {
                     volPtrs.insert(Ins);
-                    dbg(errs()<<"malloc/calloc/realloc ptr: " << *Ins << "\n";)
+                    dbg(errs()<<"malloc/calloc/realloc/exception ptr: " << *Ins << "\n";)
 
                     std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
                     for (auto User : Users) 
@@ -476,10 +475,63 @@ SPPLTO::trackPtrs(Function* F)
                     }
                 }                        
                 //- PM ptr -//
-                else if (CalleeF->getName().contains("pmemobj_direct_inline")) {
+                else if (CalleeF->getName().contains("pmemobj_direct")) {
                     pmemPtrs.insert(Ins);
-                    dbg(errs()<<"PM ptr: "<<*Ins<<"\n";)
+                    errs()<<"PM ptr: "<<*Ins<<"\n";
+                    std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
+                    for (auto User : Users) 
+                    {
+                        Instruction *iUser= dyn_cast<Instruction>(User);
+                        dbg(errs() << ">>pm ptr use: " << *iUser << "\n";)
+
+                        // mark directly derived values as volatile:
+                        switch (iUser->getOpcode()) 
+                        {
+                            case Instruction::BitCast:
+                            case Instruction::GetElementPtr:
+                                pmemPtrs.insert(iUser);
+                            default:
+                                break;
+                        }  
+                    }
                 }
+            }
+            /* vtable,vbase and vfn variables */
+            else if (Ins->getName().startswith("vbase.offset") ||
+                    Ins->getName().startswith("vfn") ||
+                    Ins->getName().startswith("vtable"))
+            {
+                vtPtrs.insert(Ins);
+                dbg(errs()<<"Vtable ptr: "<<*Ins<<"\n";)
+                std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
+                for (auto User : Users) 
+                {
+                    Instruction *iUser= dyn_cast<Instruction>(User);
+                    dbg(errs() << ">>Virtual ptr use: " << *iUser << "\n";)
+                    // mark directly derived values as volatile:
+                    switch (iUser->getOpcode()) 
+                    {
+                        case Instruction::BitCast:
+                        case Instruction::PtrToInt:
+                        case Instruction::IntToPtr:
+                        case Instruction::GetElementPtr:
+                        case Instruction::ExtractValue:
+                        case Instruction::InsertValue:
+                            vtPtrs.insert(iUser);
+                        default:
+                            break;
+                    }  
+                }
+            }
+            else if (auto *EV = dyn_cast<ExtractValueInst>(Ins)) 
+            {
+                assert(!EV->getOperand(0)->getType()->isPointerTy() && 
+                        "Extract value with ptr operand currently not supported");
+            }
+            else if (auto *IV = dyn_cast<InsertValueInst>(Ins)) 
+            {
+                assert(!IV->getOperand(0)->getType()->isPointerTy() && 
+                        "Insert value with ptr operand currently not supported");
             }
         }
     } //endof forloop
@@ -522,11 +574,13 @@ SPPLTO::redundantCB(Function *FN)
                                 continue;
                             }
 
-                            if ( extPtrs.find(ArgVal) != extPtrs.end() )
+                            if ( extPtrs.find(ArgVal) != extPtrs.end() ||
+                                 volPtrs.find(ArgVal) != volPtrs.end() ||
+                                 vtPtrs.find(ArgVal) != vtPtrs.end() )
                             {   
                                 //replace uses of the returned value with ArgVal
                                 //and remove the function call
-                                dbg(errs() << ">>external ptr -- should skip : " << *cb << " Uses: " \
+                                dbg(errs() << ">>ext or vol ptr -- should skip : " << *cb << " Uses: " \
                                             << cb->getNumUses() << " argval: " << *ArgVal << "\n";)
                                 cb->replaceAllUsesWith(ArgVal);
 

@@ -1068,7 +1068,7 @@ namespace {
                             CalleeF->getName().contains("__cxa")) 
                         {
                             volPtrs.insert(Ins);
-                            dbg(errs()<<"malloc/calloc/realloc ptr: " << *Ins << "\n";)
+                            dbg(errs()<<"malloc/calloc/realloc/exception ptr: " << *Ins << "\n";)
 
                             std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
                             for (auto User : Users) 
@@ -1131,11 +1131,47 @@ namespace {
                                 case Instruction::PtrToInt:
                                 case Instruction::IntToPtr:
                                 case Instruction::GetElementPtr:
+                                case Instruction::ExtractValue:
+                                case Instruction::InsertValue:
                                     vtPtrs.insert(iUser);
                                 default:
                                     break;
                             }  
                         }
+                    }
+                    else if (auto *PHI = dyn_cast<PHINode>(Ins)) 
+                    {
+                        if (PHI->getType()->isPointerTy())
+                        {
+                            if (PHI->getOperand(0)->getType()->isPointerTy() &&
+                                PHI->getOperand(1)->getType()->isPointerTy())
+                            {
+                                // if ( (volPtrs.find(PHI->getOperand(0)->stripPointerCasts()) != volPtrs.end() ||
+                                //     globalPtrs.find(PHI->getOperand(0)->stripPointerCasts()) != globalPtrs.end() ||
+                                //     vtPtrs.find(PHI->getOperand(0)->stripPointerCasts()) != vtPtrs.end())
+                                //     &&
+                                //     (volPtrs.find(PHI->getOperand(1)->stripPointerCasts()) != volPtrs.end() ||
+                                //     globalPtrs.find(PHI->getOperand(1)->stripPointerCasts()) != globalPtrs.end() ||
+                                //     vtPtrs.find(PHI->getOperand(1)->stripPointerCasts()) != vtPtrs.end()) )
+                                // if ( volPtrs.find(PHI->getOperand(0)->stripPointerCasts()) != volPtrs.end() ||
+                                //      volPtrs.find(PHI->getOperand(1)->stripPointerCasts()) != volPtrs.end() )
+                                // {
+                                    // errs() << "phi: " << *PHI << "\n";
+                                    // errs() << "operand 0: " << *PHI->getOperand(0)->stripPointerCasts() << "\n";
+                                    // errs() << "operand 1: " << *PHI->getOperand(1)->stripPointerCasts() << "\n";
+                                // }
+                            }
+                        }
+                    }
+                    else if (auto *EV = dyn_cast<ExtractValueInst>(Ins)) 
+                    {
+                        assert(!EV->getOperand(0)->getType()->isPointerTy() && 
+                                "Extract value with ptr operand currently not supported");
+                    }
+                    else if (auto *IV = dyn_cast<InsertValueInst>(Ins)) 
+                    {
+                        assert(!IV->getOperand(0)->getType()->isPointerTy() && 
+                                "Insert value with ptr operand currently not supported");
                     }
                 }
             }
