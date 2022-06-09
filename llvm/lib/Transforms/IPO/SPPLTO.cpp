@@ -172,6 +172,9 @@ static void memCleanUp()
     volPtrs.clear();
     globalPtrs.clear();
     pmemPtrs.clear();
+    // for (auto extPtr : extPtrs) {
+    //     errs()<< "ext Ptr:" << *extPtr << "\n"; 
+    // }
     extPtrs.clear();
     vtPtrs.clear();
 }
@@ -289,10 +292,10 @@ doCallExternal(CallBase *CB)
             continue; 
         } 
 
-        if ( volPtrs.find(ArgVal) != volPtrs.end() ||
-             vtPtrs.find(ArgVal) != vtPtrs.end() ||
-             globalPtrs.find(ArgVal) != globalPtrs.end() ||
-             extPtrs.find(ArgVal) != extPtrs.end() )
+        if ( volPtrs.find(ArgVal->stripPointerCasts()) != volPtrs.end() ||
+             vtPtrs.find(ArgVal->stripPointerCasts()) != vtPtrs.end() ||
+             globalPtrs.find(ArgVal->stripPointerCasts()) != globalPtrs.end() ||
+             extPtrs.find(ArgVal->stripPointerCasts()) != extPtrs.end() )
         {
             dbg(errs() << ">>global, volatile or external ptr skipped cleaning: " << *CB << "\n";)
             continue;
@@ -436,6 +439,7 @@ SPPLTO::trackPtrs(Function* F)
                         case Instruction::IntToPtr:
                         case Instruction::GetElementPtr:
                             volPtrs.insert(iUser);
+                            dbg(errs() << ">>Local ptr use: " << *iUser << "\n";)
                         default:
                             break;
                     }                      
@@ -574,9 +578,11 @@ SPPLTO::redundantCB(Function *FN)
                                 continue;
                             }
 
-                            if ( extPtrs.find(ArgVal) != extPtrs.end() ||
-                                 volPtrs.find(ArgVal) != volPtrs.end() ||
-                                 vtPtrs.find(ArgVal) != vtPtrs.end() )
+                            // stripPointerCasts() is needed to identify untracked bitcasts
+                            if ( extPtrs.find(ArgVal->stripPointerCasts()) != extPtrs.end() ||
+                                 globalPtrs.find(ArgVal->stripPointerCasts()) != globalPtrs.end() ||
+                                 volPtrs.find(ArgVal->stripPointerCasts()) != volPtrs.end() ||
+                                 vtPtrs.find(ArgVal->stripPointerCasts()) != vtPtrs.end() )
                             {   
                                 //replace uses of the returned value with ArgVal
                                 //and remove the function call
@@ -670,6 +676,28 @@ SPPLTO::runOnModule(Module &M)
     {
         dbg(errs() << "Global found : " << *GV << "\n";)
         globalPtrs.insert(&*GV);
+        std::vector<User*> Users(GV->user_begin(), GV->user_end());
+        for (auto User : Users) 
+        {
+            Instruction *iUser= dyn_cast<Instruction>(User);
+            if (iUser && iUser->getType()->isPointerTy())
+            {
+                dbg(errs() << ">>Global use: " << *iUser << "\n";)
+                // mark directly derived values as volatile:
+                switch (iUser->getOpcode()) 
+                {
+                    case Instruction::BitCast:
+                    case Instruction::PtrToInt:
+                    case Instruction::IntToPtr:
+                    case Instruction::GetElementPtr:
+                        globalPtrs.insert(iUser);
+                        dbg(errs() << ">>Global ptr use: " << *iUser << "\n";)
+                    default:
+                        break;
+                }
+            }                     
+        }
+
     }
 
     for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
@@ -713,10 +741,10 @@ SPPLTO::runOnModule(Module &M)
     // {
     //     for (auto BB = Fn->begin(); BB != Fn->end(); ++BB) 
     //     {
-    //         for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
-    //         {
-    //             errs() << *ins << "\n";
-    //         }
+    //         BasicBlock *BaB = &*BB; 
+    //         if (BaB == &BaB->getParent()->getEntryBlock())
+    //             errs() << *Fn <<"\n";
+    //         errs() << *BB << "\n";
     //     }
     // }
 
