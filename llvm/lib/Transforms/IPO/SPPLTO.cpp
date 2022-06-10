@@ -413,6 +413,38 @@ SPPLTO::doCallBase(CallBase *cb)
 bool 
 SPPLTO::trackPtrs(Function* F) 
 {
+
+    dbg(errs() << "Function: " << F->getName() << "\n";)
+    for (auto Arg = F->arg_begin(); Arg != F->arg_end(); ++Arg) 
+    {
+        if (Arg->getType()->isPointerTy() && 
+            (Arg->hasAttribute(Attribute::ByVal) ||
+             Arg->hasAttribute(Attribute::StructRet)))
+        {
+            dbg(errs()<<">> Already Cleaned Argument ByVal " << *Arg <<  "\n";)
+            volPtrs.insert(Arg);  
+            
+            std::vector<User*> Users(Arg->user_begin(), Arg->user_end());
+            for (auto User : Users) 
+            {
+                Instruction *iUser= dyn_cast<Instruction>(User);
+
+                // mark directly derived values as volatile:
+                switch (iUser->getOpcode()) 
+                {
+                    case Instruction::BitCast:
+                    case Instruction::PtrToInt:
+                    case Instruction::IntToPtr:
+                    case Instruction::GetElementPtr:
+                        volPtrs.insert(Arg);
+                        dbg(errs() << ">>ByVal Arg ptr use: " << *iUser << "\n";)
+                    default:
+                        break;
+                }                      
+            }
+        }
+    }
+
     for (auto BI= F->begin(); BI!= F->end(); ++BI) 
     {
         BasicBlock *BB = &*BI; 
@@ -477,11 +509,38 @@ SPPLTO::trackPtrs(Function* F)
                                 break;
                         }  
                     }
-                }                        
+                }
+                //- already cleaned ptr -//
+                if (CalleeF->getName().contains("__spp_cleantag") ||
+                    CalleeF->getName().contains("__spp_memintr_check_and_clean") ||
+                    CalleeF->getName().contains("__spp_checkbound")) 
+                {
+                    volPtrs.insert(Ins);
+                    dbg(errs()<<"malloc/calloc/realloc/exception ptr: " << *Ins << "\n";)
+
+                    std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
+                    for (auto User : Users) 
+                    {
+                        Instruction *iUser= dyn_cast<Instruction>(User);
+                        dbg(errs() << ">>vol ptr use: " << *iUser << "\n";)
+
+                        // mark directly derived values as volatile:
+                        switch (iUser->getOpcode()) 
+                        {
+                            case Instruction::BitCast:
+                            case Instruction::PtrToInt:
+                            case Instruction::IntToPtr:
+                            case Instruction::GetElementPtr:
+                                volPtrs.insert(iUser);
+                            default:
+                                break;
+                        }  
+                    }
+                }                
                 //- PM ptr -//
                 else if (CalleeF->getName().contains("pmemobj_direct")) {
                     pmemPtrs.insert(Ins);
-                    errs()<<"PM ptr: "<<*Ins<<"\n";
+                    dbg(errs()<<"PM ptr: "<<*Ins<<"\n";)
                     std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
                     for (auto User : Users) 
                     {
@@ -748,6 +807,8 @@ SPPLTO::runOnModule(Module &M)
     //     }
     // }
 
+    // errs() << M << "\n";
+    
     memCleanUp();
 
     errs() << ">>Leaving SPPLTO\n";

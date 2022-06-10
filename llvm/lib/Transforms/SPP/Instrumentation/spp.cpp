@@ -1025,6 +1025,39 @@ namespace {
 
         bool trackPtrs(Function* F) 
         {
+
+            // first check the byval arguments as they will be cleaned
+            dbg(errs() << F->getName() << "\n";)
+            for (auto Arg = F->arg_begin(); Arg != F->arg_end(); ++Arg) 
+            {
+                if (Arg->getType()->isPointerTy() && 
+                    (Arg->hasAttribute(Attribute::ByVal) ||
+                    Arg->hasAttribute(Attribute::StructRet)))
+                {
+                    dbg(errs()<<">> Already Cleaned Argument ByVal " << *Arg <<  "\n";)
+                    volPtrs.insert(Arg);  
+                    
+                    std::vector<User*> Users(Arg->user_begin(), Arg->user_end());
+                    for (auto User : Users) 
+                    {
+                        Instruction *iUser= dyn_cast<Instruction>(User);
+
+                        // mark directly derived values as volatile:
+                        switch (iUser->getOpcode()) 
+                        {
+                            case Instruction::BitCast:
+                            case Instruction::PtrToInt:
+                            case Instruction::IntToPtr:
+                            case Instruction::GetElementPtr:
+                                volPtrs.insert(Arg);
+                                dbg(errs() << ">>ByVal Arg ptr use: " << *iUser << "\n";)
+                            default:
+                                break;
+                        }                      
+                    }
+                }
+            }
+
             for (auto BI= F->begin(); BI!= F->end(); ++BI) 
             {
                 BasicBlock *BB = &*BI; 
@@ -1225,6 +1258,27 @@ namespace {
             {
                 dbg(errs() << "Global found : " << *GV << "\n";)
                 Spp.globalPtrs.insert(&*GV);
+                std::vector<User*> Users(GV->user_begin(), GV->user_end());
+                for (auto User : Users) 
+                {
+                    Instruction *iUser= dyn_cast<Instruction>(User);
+                    if (iUser && iUser->getType()->isPointerTy())
+                    {
+                        dbg(errs() << ">>Global use: " << *iUser << "\n";)
+                        // mark directly derived values as volatile:
+                        switch (iUser->getOpcode()) 
+                        {
+                            case Instruction::BitCast:
+                            case Instruction::PtrToInt:
+                            case Instruction::IntToPtr:
+                            case Instruction::GetElementPtr:
+                                Spp.globalPtrs.insert(iUser);
+                                dbg(errs() << ">>Global ptr use: " << *iUser << "\n";)
+                            default:
+                                break;
+                        }
+                    }                     
+                }
             }
             
             //Visit the functions to identify volatile ptrs, pm and vtable ptrs
@@ -1243,7 +1297,6 @@ namespace {
 
                 dbg(errs() << "Internal.. processing\n";)
                 changed = Spp.trackPtrs(&*F);
-            
             }
             //Visit the functions to clear the appropriate ptr before external calls
             for (auto F = M.begin(), Fend = M.end(); F != Fend; ++F) 
