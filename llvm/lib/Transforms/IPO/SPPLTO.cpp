@@ -82,6 +82,8 @@ struct SPPLTO : public ModulePass {
   }
   
   virtual bool redundantCB(Function *F);
+  virtual bool redundantTagUpdates(Function *F);
+  virtual bool duplicateCleanTags(Function *F);
   virtual bool trackPtrs (Function * F);
   virtual bool runOnFunction (Function * F, Module &M);
   virtual bool runOnModule(Module &M) override;
@@ -112,7 +114,7 @@ struct SPPLTO : public ModulePass {
 } // end anonymous namespace
 
 static std::unordered_set <Value*> globalPtrs;
-static std::unordered_set <Value*> volPtrs;
+static std::unordered_set <Value*> untaggedPtrs;
 static std::unordered_set <Value*> pmemPtrs;
 static std::unordered_set <Value*> extPtrs;
 static std::unordered_set <Value*> vtPtrs;
@@ -164,12 +166,13 @@ static void eraseRedundantChecks()
         eraseI->eraseFromParent(); 
     }
     dbg(errs()<<">>ERASE_done\n";)
+    redundantChecks.clear();
 }
         
 static void memCleanUp()
 {
     redundantChecks.clear();
-    volPtrs.clear();
+    untaggedPtrs.clear();
     globalPtrs.clear();
     pmemPtrs.clear();
     // for (auto extPtr : extPtrs) {
@@ -292,7 +295,7 @@ doCallExternal(CallBase *CB)
             continue; 
         } 
 
-        if ( volPtrs.find(ArgVal->stripPointerCasts()) != volPtrs.end() ||
+        if ( untaggedPtrs.find(ArgVal->stripPointerCasts()) != untaggedPtrs.end() ||
              vtPtrs.find(ArgVal->stripPointerCasts()) != vtPtrs.end() ||
              globalPtrs.find(ArgVal->stripPointerCasts()) != globalPtrs.end() ||
              extPtrs.find(ArgVal->stripPointerCasts()) != extPtrs.end() )
@@ -422,7 +425,7 @@ SPPLTO::trackPtrs(Function* F)
              Arg->hasAttribute(Attribute::StructRet)))
         {
             dbg(errs()<<">> Already Cleaned Argument ByVal " << *Arg <<  "\n";)
-            volPtrs.insert(Arg);  
+            untaggedPtrs.insert(Arg);  
             
             std::vector<User*> Users(Arg->user_begin(), Arg->user_end());
             for (auto User : Users) 
@@ -436,7 +439,7 @@ SPPLTO::trackPtrs(Function* F)
                     case Instruction::PtrToInt:
                     case Instruction::IntToPtr:
                     case Instruction::GetElementPtr:
-                        volPtrs.insert(Arg);
+                        untaggedPtrs.insert(Arg);
                         dbg(errs() << ">>ByVal Arg ptr use: " << *iUser << "\n";)
                     default:
                         break;
@@ -455,7 +458,7 @@ SPPLTO::trackPtrs(Function* F)
 
             if (isa<AllocaInst>(Ins)) 
             {
-                volPtrs.insert(Ins);  
+                untaggedPtrs.insert(Ins);  
                 dbg(errs()<<"Local: "<< *Ins <<"\n";)
                 std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
                 for (auto User : Users) 
@@ -470,7 +473,7 @@ SPPLTO::trackPtrs(Function* F)
                         case Instruction::PtrToInt:
                         case Instruction::IntToPtr:
                         case Instruction::GetElementPtr:
-                            volPtrs.insert(iUser);
+                            untaggedPtrs.insert(iUser);
                             dbg(errs() << ">>Local ptr use: " << *iUser << "\n";)
                         default:
                             break;
@@ -488,7 +491,7 @@ SPPLTO::trackPtrs(Function* F)
                     CalleeF->getName().contains("__errno_location") ||
                     CalleeF->getName().startswith("__cxa_")) 
                 {
-                    volPtrs.insert(Ins);
+                    untaggedPtrs.insert(Ins);
                     dbg(errs()<<"malloc/calloc/realloc/exception ptr: " << *Ins << "\n";)
 
                     std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
@@ -504,7 +507,7 @@ SPPLTO::trackPtrs(Function* F)
                             case Instruction::PtrToInt:
                             case Instruction::IntToPtr:
                             case Instruction::GetElementPtr:
-                                volPtrs.insert(iUser);
+                                untaggedPtrs.insert(iUser);
                             default:
                                 break;
                         }  
@@ -515,7 +518,7 @@ SPPLTO::trackPtrs(Function* F)
                     CalleeF->getName().contains("__spp_memintr_check_and_clean") ||
                     CalleeF->getName().contains("__spp_checkbound")) 
                 {
-                    volPtrs.insert(Ins);
+                    untaggedPtrs.insert(Ins);
                     dbg(errs()<<"malloc/calloc/realloc/exception ptr: " << *Ins << "\n";)
 
                     std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
@@ -531,7 +534,7 @@ SPPLTO::trackPtrs(Function* F)
                             case Instruction::PtrToInt:
                             case Instruction::IntToPtr:
                             case Instruction::GetElementPtr:
-                                volPtrs.insert(iUser);
+                                untaggedPtrs.insert(iUser);
                             default:
                                 break;
                         }  
@@ -547,7 +550,7 @@ SPPLTO::trackPtrs(Function* F)
                         Instruction *iUser= dyn_cast<Instruction>(User);
                         dbg(errs() << ">>pm ptr use: " << *iUser << "\n";)
 
-                        // mark directly derived values as volatile:
+                        // mark directly derived values as persistent:
                         switch (iUser->getOpcode()) 
                         {
                             case Instruction::BitCast:
@@ -556,6 +559,36 @@ SPPLTO::trackPtrs(Function* F)
                             default:
                                 break;
                         }  
+                    }
+                }
+                //- PM ptr progataion for update tag -//
+                else if (CalleeF->getName().contains("__spp_updatetag")) {                    
+                    dbg(errs() << *Ins <<" Arg: " << *CI->getArgOperand(0) << "\n";)
+                    // get the update tag argument
+                    Value *ArgVal = dyn_cast<Value>(CI->getArgOperand(0));
+                    
+                    if (ArgVal && ArgVal->getType()->isPointerTy())
+                    {
+                        if ( pmemPtrs.find(ArgVal->stripPointerCasts()) != pmemPtrs.end() )
+                        {
+                            pmemPtrs.insert(Ins);
+                            std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
+                            for (auto User : Users) 
+                            {
+                                Instruction *iUser= dyn_cast<Instruction>(User);
+                                dbg(errs() << ">>pm ptr use: " << *iUser << "\n";)
+
+                                // mark directly derived values as volatile:
+                                switch (iUser->getOpcode()) 
+                                {
+                                    case Instruction::BitCast:
+                                    case Instruction::GetElementPtr:
+                                        pmemPtrs.insert(iUser);
+                                    default:
+                                        break;
+                                }  
+                            }
+                        }
                     }
                 }
             }
@@ -603,6 +636,105 @@ SPPLTO::trackPtrs(Function* F)
 }
 
 bool
+SPPLTO::duplicateCleanTags(Function *FN)
+{
+    bool changed = false;
+    
+    for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
+    {
+        DenseMap<Value*, Value*> cleanedVals;
+        for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
+        { 
+            if (auto cb = dyn_cast<CallInst>(ins)) 
+            {
+                Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
+                if (cfn)
+                {
+                    // Check for redundant updatetag calls that are directly cleaned
+                    if (cfn->getName().contains("__spp_cleantag"))
+                    {
+                        Value* ArgVal = cb->getOperand(0)->stripPointerCasts();
+                        if (cleanedVals.find(ArgVal) == cleanedVals.end()) 
+                        {
+                            cleanedVals[ArgVal] = cb;
+                            errs() << *cb << " op : " << *ArgVal << "\n";   
+                        }
+                        else 
+                        {
+                            errs() << *cb << " duplicate cleantag : " << *ArgVal << "\n";
+                            errs() << "should be replaced with: " << *cleanedVals[ArgVal] << "\n";
+                            cb->replaceAllUsesWith(cleanedVals[ArgVal]);
+                            redundantChecks.push_back(cb);
+                        }
+                    }
+                }
+            }
+        }
+        cleanedVals.clear();
+    }
+    return changed;
+}
+
+bool
+SPPLTO::redundantTagUpdates(Function *FN)
+{
+    bool changed = false;
+
+    for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
+    {
+        for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
+        { 
+            if (auto cb = dyn_cast<CallInst>(ins)) 
+            {
+                Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
+                if (cfn)
+                {
+                    // Check for redundant updatetag calls that are directly cleaned
+                    if (cfn->getName().contains("__spp_updatetag"))
+                    {
+                        bool redundant = true;
+                        std::vector<User*> Users(cb->user_begin(), cb->user_end());
+                        dbg(errs() << "update tag call " << *cb << "\n";)
+                        for (auto User : Users) 
+                        {
+                            if (auto CI = dyn_cast<CallInst>(User))
+                            {
+                                Function *calledFn = dyn_cast<Function>(CI->getCalledOperand()->stripPointerCasts());
+                                if (calledFn && calledFn->getName().contains("__spp_cleantag"))
+                                    continue;
+                            }
+                            //if at least one use is not a cleantag, keep it in for now
+                            redundant = false;
+                            break;
+                        }
+                        // it's redundant, replace the ptr of the clean tag with the one of updatetag input
+                        // and erase the instruction
+                        if (redundant)
+                        {
+                            dbg(errs() << "found update tag " << *cb << "\n";)
+                            for (auto User : Users) 
+                            {
+                                if (auto CI = dyn_cast<CallInst>(User))
+                                {
+                                    Function *calledFn = dyn_cast<Function>(CI->getCalledOperand()->stripPointerCasts());
+                                    if (calledFn && calledFn->getName().contains("__spp_cleantag"))
+                                    {
+                                        CI->setOperand(0, cb->getOperand(0));
+                                    }
+                                    
+                                }
+                            }
+                            redundantChecks.push_back(cb);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return changed;
+}
+
+bool
 SPPLTO::redundantCB(Function *FN)
 {
     bool changed = false;
@@ -640,7 +772,7 @@ SPPLTO::redundantCB(Function *FN)
                             // stripPointerCasts() is needed to identify untracked bitcasts
                             if ( extPtrs.find(ArgVal->stripPointerCasts()) != extPtrs.end() ||
                                  globalPtrs.find(ArgVal->stripPointerCasts()) != globalPtrs.end() ||
-                                 volPtrs.find(ArgVal->stripPointerCasts()) != volPtrs.end() ||
+                                 untaggedPtrs.find(ArgVal->stripPointerCasts()) != untaggedPtrs.end() ||
                                  vtPtrs.find(ArgVal->stripPointerCasts()) != vtPtrs.end() )
                             {   
                                 //replace uses of the returned value with ArgVal
@@ -793,9 +925,27 @@ SPPLTO::runOnModule(Module &M)
     }
 
     if (!hasZeroRedundantChecks()) {
-        eraseRedundantChecks(); 
+        eraseRedundantChecks();
     }
- 
+    
+    for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+    { 
+        redundantTagUpdates(&*Fn);
+    }
+
+    if (!hasZeroRedundantChecks()){
+        eraseRedundantChecks();
+    }
+
+    for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+    { 
+        duplicateCleanTags(&*Fn);
+    }
+
+    if (!hasZeroRedundantChecks()){
+        eraseRedundantChecks();
+    }
+
     // for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
     // {
     //     for (auto BB = Fn->begin(); BB != Fn->end(); ++BB) 
@@ -807,7 +957,7 @@ SPPLTO::runOnModule(Module &M)
     //     }
     // }
 
-    // errs() << M << "\n";
+    errs() << M << "\n";
     
     memCleanUp();
 
