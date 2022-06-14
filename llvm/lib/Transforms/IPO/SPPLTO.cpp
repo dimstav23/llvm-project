@@ -657,12 +657,12 @@ SPPLTO::duplicateCleanTags(Function *FN)
                         if (cleanedVals.find(ArgVal) == cleanedVals.end()) 
                         {
                             cleanedVals[ArgVal] = cb;
-                            errs() << *cb << " op : " << *ArgVal << "\n";   
+                            dbg(errs() << *cb << " op : " << *ArgVal << "\n";)  
                         }
                         else 
                         {
-                            errs() << *cb << " duplicate cleantag : " << *ArgVal << "\n";
-                            errs() << "should be replaced with: " << *cleanedVals[ArgVal] << "\n";
+                            dbg(errs() << *cb << " duplicate cleantag : " << *ArgVal << "\n";)
+                            dbg(errs() << "should be replaced with: " << *cleanedVals[ArgVal] << "\n";)
                             cb->replaceAllUsesWith(cleanedVals[ArgVal]);
                             redundantChecks.push_back(cb);
                         }
@@ -957,7 +957,7 @@ SPPLTO::runOnModule(Module &M)
     //     }
     // }
 
-    errs() << M << "\n";
+    // errs() << M << "\n";
     
     memCleanUp();
 
