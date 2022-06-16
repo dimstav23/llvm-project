@@ -86,6 +86,13 @@ namespace {
         DenseMap<Instruction*, Instruction*> optimizedMemInsts;
         //TODO: Debuglist.
 
+        enum operandType {
+            VOL,
+            PM,
+            CONST,
+            UKNOWN
+        };
+
     public:
         std::unordered_set <Value*> globalPtrs;
         std::unordered_set <Value*> untaggedPtrs;
@@ -395,7 +402,7 @@ namespace {
             FunctionCallee hook;
             if (pmemPtrs.find(Ptr->stripPointerCasts()) != pmemPtrs.end())
             {
-                errs() << "__spp_cleantag_direct\n";
+                dbg(errs() << "__spp_cleantag_direct\n";)
                 hook = M->getOrInsertFunction("__spp_cleantag_direct", hookfty);
             }
             else 
@@ -468,12 +475,12 @@ namespace {
                     FunctionCallee hook;
                     if ( pmemPtrs.find(ArgVal->stripPointerCasts()) != pmemPtrs.end() )
                     {
-                        errs() << "__spp_cleantag_direct\n";
+                        dbg(errs() << "__spp_cleantag_direct\n";)
                         hook = hook_direct;
                     }
                     else
                     {
-                        errs() << "__spp_cleantag for " << *ArgVal << "\n";
+                        dbg(errs() << "__spp_cleantag for " << *ArgVal << "\n";)
                         hook = hook_generic;
                     }                    
                     Value *TmpPtr = B.CreateBitCast(ArgVal, 
@@ -1291,27 +1298,124 @@ namespace {
                             }  
                         }
                     }
+                    else if (auto *Gep = dyn_cast<GetElementPtrInst>(Ins)) 
+                    {
+                        Value *Operand = Gep->getPointerOperand()->stripPointerCasts();
+                        if (pmemPtrs.find(Operand) != pmemPtrs.end())
+                        {
+                            pmemPtrs.insert(Gep);
+                        }
+                        else if (untaggedPtrs.find(Operand) != untaggedPtrs.end() ||
+                                globalPtrs.find(Operand) != globalPtrs.end() ||
+                                vtPtrs.find(Operand) != vtPtrs.end())
+                        {
+                            untaggedPtrs.insert(Gep);
+                        }
+                    }
+                    else if (auto *Bitcast = dyn_cast<BitCastInst>(Ins)) 
+                    {
+                        Value *Operand = Bitcast->getOperand(0)->stripPointerCasts();
+                        if (pmemPtrs.find(Operand) != pmemPtrs.end())
+                        {
+                            pmemPtrs.insert(Bitcast);
+                        }
+                        else if (untaggedPtrs.find(Operand) != untaggedPtrs.end() ||
+                                globalPtrs.find(Operand) != globalPtrs.end() ||
+                                vtPtrs.find(Operand) != vtPtrs.end())
+                        {
+                            untaggedPtrs.insert(Bitcast);
+                        }
+                    }
                     else if (auto *PHI = dyn_cast<PHINode>(Ins)) 
                     {
                         if (PHI->getType()->isPointerTy())
                         {
-                            if (PHI->getOperand(0)->getType()->isPointerTy() &&
-                                PHI->getOperand(1)->getType()->isPointerTy())
+                            dbg(errs() << ">>>" << *PHI <<"\n";)
+
+                            operandType phiType = PM;
+                            std::vector<Value*> Ops(PHI->op_begin(), PHI->op_end());
+                            for (auto Op : Ops)
                             {
-                                // if ( (untaggedPtrs.find(PHI->getOperand(0)->stripPointerCasts()) != untaggedPtrs.end() ||
-                                //     globalPtrs.find(PHI->getOperand(0)->stripPointerCasts()) != globalPtrs.end() ||
-                                //     vtPtrs.find(PHI->getOperand(0)->stripPointerCasts()) != vtPtrs.end())
-                                //     &&
-                                //     (untaggedPtrs.find(PHI->getOperand(1)->stripPointerCasts()) != untaggedPtrs.end() ||
-                                //     globalPtrs.find(PHI->getOperand(1)->stripPointerCasts()) != globalPtrs.end() ||
-                                //     vtPtrs.find(PHI->getOperand(1)->stripPointerCasts()) != vtPtrs.end()) )
-                                // if ( untaggedPtrs.find(PHI->getOperand(0)->stripPointerCasts()) != untaggedPtrs.end() ||
-                                //      untaggedPtrs.find(PHI->getOperand(1)->stripPointerCasts()) != untaggedPtrs.end() )
-                                // {
-                                    // errs() << "phi: " << *PHI << "\n";
-                                    // errs() << "operand 0: " << *PHI->getOperand(0)->stripPointerCasts() << "\n";
-                                    // errs() << "operand 1: " << *PHI->getOperand(1)->stripPointerCasts() << "\n";
-                                // }
+                                Value *StrippedOp = Op->stripPointerCasts();
+                                dbg(errs() << *StrippedOp << " type : " << *StrippedOp->getType() << "\n";)
+                                if (isa<Constant>(StrippedOp) ||
+                                    pmemPtrs.find(StrippedOp) != pmemPtrs.end())
+                                {
+                                    dbg(errs() << *StrippedOp << " pm type : " << *StrippedOp->getType() << "\n";)
+                                    continue;
+                                }
+                                else
+                                {
+                                    dbg(errs() << *StrippedOp << " ignored type : " << *StrippedOp->getType() << "\n";)
+                                    phiType = UKNOWN;
+                                    break;
+                                }
+                            }
+                            if (phiType == PM)
+                            {
+                                dbg(errs() << "persistent phi: " << *PHI << "\n";)
+                                pmemPtrs.insert(PHI);
+                                std::vector<User*> Users(PHI->user_begin(), PHI->user_end());
+                                for (auto User : Users) 
+                                {
+                                    Instruction *iUser= dyn_cast<Instruction>(User);
+                                    dbg(errs() << ">>PM ptr from PHI use: " << *iUser << "\n";)
+                                    // mark directly derived values as volatile:
+                                    switch (iUser->getOpcode()) 
+                                    {
+                                        case Instruction::BitCast:
+                                        case Instruction::GetElementPtr:
+                                            pmemPtrs.insert(iUser);
+                                        default:
+                                            break;
+                                    }  
+                                }
+                                continue;
+                            }
+
+                            phiType = VOL;
+                            for (auto Op : Ops)
+                            {
+                                Value *StrippedOp = Op->stripPointerCasts();
+                                dbg(errs() << *StrippedOp << " type : " << *StrippedOp->getType() << "\n";)
+                                if (isa<Constant>(StrippedOp) ||
+                                    untaggedPtrs.find(StrippedOp) != untaggedPtrs.end() ||
+                                    globalPtrs.find(StrippedOp) != globalPtrs.end() ||
+                                    vtPtrs.find(StrippedOp) != vtPtrs.end())
+                                {
+                                    dbg(errs() << *StrippedOp << " vol type : " << *StrippedOp->getType() << "\n";)
+                                    continue;
+                                }
+                                else
+                                {
+                                    dbg(errs() << *StrippedOp << " ignored type : " << *StrippedOp->getType() << "\n";)
+                                    phiType = UKNOWN;
+                                    break;
+                                }
+                            }
+
+                            if (phiType == VOL)
+                            {
+                                dbg(errs() << "volatile phi: " << *PHI << "\n";)
+                                untaggedPtrs.insert(PHI);
+                                std::vector<User*> Users(PHI->user_begin(), PHI->user_end());
+                                for (auto User : Users) 
+                                {
+                                    Instruction *iUser= dyn_cast<Instruction>(User);
+                                    dbg(errs() << ">>vol ptr from PHI use: " << *iUser << "\n";)
+                                    // mark directly derived values as volatile:
+                                    switch (iUser->getOpcode()) 
+                                    {
+                                        case Instruction::BitCast:
+                                        case Instruction::PtrToInt:
+                                        case Instruction::IntToPtr:
+                                        case Instruction::GetElementPtr:
+                                            untaggedPtrs.insert(iUser);
+                                        default:
+                                            break;
+                                    }  
+                                }
+                                continue;
                             }
                         }
                     }

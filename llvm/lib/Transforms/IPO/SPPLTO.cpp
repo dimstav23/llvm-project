@@ -76,6 +76,13 @@ namespace {
 struct SPPLTO : public ModulePass {
   static char ID;
 
+  enum operandType {
+        VOL,
+        PM,
+        CONST,
+        UKNOWN
+    };
+
   SPPLTO() : ModulePass(ID) 
   {
     initializeSPPLTOPass(*PassRegistry::getPassRegistry());
@@ -621,6 +628,127 @@ SPPLTO::trackPtrs(Function* F)
                     }  
                 }
             }
+            else if (auto *Gep = dyn_cast<GetElementPtrInst>(Ins)) 
+            {
+                Value *Operand = Gep->getPointerOperand()->stripPointerCasts();
+                if (pmemPtrs.find(Operand) != pmemPtrs.end())
+                {
+                    pmemPtrs.insert(Gep);
+                }
+                else if (untaggedPtrs.find(Operand) != untaggedPtrs.end() ||
+                         globalPtrs.find(Operand) != globalPtrs.end() ||
+                         vtPtrs.find(Operand) != vtPtrs.end())
+                {
+                    dbg(errs() << "GEP propagation " << *Bitcast << "\n";)
+                    untaggedPtrs.insert(Gep);
+                }
+            }
+            else if (auto *Bitcast = dyn_cast<BitCastInst>(Ins)) 
+            {
+                Value *Operand = Bitcast->getOperand(0)->stripPointerCasts();
+                if (pmemPtrs.find(Operand) != pmemPtrs.end())
+                {
+                    pmemPtrs.insert(Bitcast);
+                }
+                else if (untaggedPtrs.find(Operand) != untaggedPtrs.end() ||
+                         globalPtrs.find(Operand) != globalPtrs.end() ||
+                         vtPtrs.find(Operand) != vtPtrs.end())
+                {
+                    dbg(errs() << "Bitcast propagation " << *Bitcast << "\n";)
+                    untaggedPtrs.insert(Bitcast);
+                }
+            }
+            else if (auto *PHI = dyn_cast<PHINode>(Ins)) 
+            {
+                if (PHI->getType()->isPointerTy())
+                {
+                    dbg(errs() << ">>>" << *PHI <<"\n";)
+
+                    operandType phiType = PM;
+                    std::vector<Value*> Ops(PHI->op_begin(), PHI->op_end());
+                    for (auto Op : Ops)
+                    {
+                        Value *StrippedOp = Op->stripPointerCasts();
+                        dbg(errs() << *StrippedOp << " type : " << *StrippedOp->getType() << "\n";)
+                        if (isa<Constant>(StrippedOp) ||
+                            pmemPtrs.find(StrippedOp) != pmemPtrs.end())
+                        {
+                            dbg(errs() << *StrippedOp << " pm type : " << *StrippedOp->getType() << "\n";)
+                            continue;
+                        }
+                        else
+                        {
+                            dbg(errs() << *StrippedOp << " ignored type : " << *StrippedOp->getType() << "\n";)
+                            phiType = UKNOWN;
+                            break;
+                        }
+                    }
+                    if (phiType == PM)
+                    {
+                        dbg(errs() << "persistent phi: " << *PHI << "\n";)
+                        pmemPtrs.insert(PHI);
+                        std::vector<User*> Users(PHI->user_begin(), PHI->user_end());
+                        for (auto User : Users) 
+                        {
+                            Instruction *iUser= dyn_cast<Instruction>(User);
+                            dbg(errs() << ">>PM ptr from PHI use: " << *iUser << "\n";)
+                            // mark directly derived values as volatile:
+                            switch (iUser->getOpcode()) 
+                            {
+                                case Instruction::BitCast:
+                                case Instruction::GetElementPtr:
+                                    pmemPtrs.insert(iUser);
+                                default:
+                                break;
+                            }  
+                        }
+                        continue;
+                    }
+                    phiType = VOL;
+                    for (auto Op : Ops)
+                    {
+                        Value *StrippedOp = Op->stripPointerCasts();
+                        dbg(errs() << *StrippedOp << " type : " << *StrippedOp->getType() << "\n";)
+                        if (isa<Constant>(StrippedOp) ||
+                            untaggedPtrs.find(StrippedOp) != untaggedPtrs.end() ||
+                            globalPtrs.find(StrippedOp) != globalPtrs.end() ||
+                            vtPtrs.find(StrippedOp) != vtPtrs.end())
+                        {
+                            dbg(errs() << *StrippedOp << " vol type : " << *StrippedOp->getType() << "\n";)
+                            continue;
+                        }
+                        else
+                        {
+                            dbg(errs() << *StrippedOp << " ignored type : " << *StrippedOp->getType() << "\n";)
+                            phiType = UKNOWN;
+                            break;
+                        }
+                    }
+                    if (phiType == VOL)
+                    {
+                        dbg(errs() << "volatile phi: " << *PHI << "\n";)
+                        untaggedPtrs.insert(PHI);
+                        std::vector<User*> Users(PHI->user_begin(), PHI->user_end());
+                        for (auto User : Users) 
+                        {
+                            Instruction *iUser= dyn_cast<Instruction>(User);
+                            dbg(errs() << ">>vol ptr from PHI use: " << *iUser << "\n";)
+                            // mark directly derived values as volatile:
+                            switch (iUser->getOpcode()) 
+                            {
+                                case Instruction::BitCast:
+                                case Instruction::PtrToInt:
+                                case Instruction::IntToPtr:
+                                case Instruction::GetElementPtr:
+                                    untaggedPtrs.insert(iUser);
+                                default:
+                                break;
+                            }  
+                        }
+                        continue;
+                    }
+                }
+            }             
             else if (auto *EV = dyn_cast<ExtractValueInst>(Ins)) 
             {
                 assert(!EV->getOperand(0)->getType()->isPointerTy() && 
