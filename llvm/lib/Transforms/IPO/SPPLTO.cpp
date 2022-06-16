@@ -246,7 +246,8 @@ doCallExternal(CallBase *CB)
     }
 
     if (CB->getCalledFunction() != NULL &&
-        !CB->getCalledFunction()->getName().contains("pmemobj_direct"))
+        !CB->getCalledFunction()->getName().contains("pmemobj_direct") &&
+        !CB->getCalledFunction()->getName().contains("pmemobj_oid"))
     {
         Value *CBval = dyn_cast<Value>(CB);
         if (CBval)
@@ -365,14 +366,16 @@ doCallFunction(CallBase *cb, Function *cfn)
     if (cfn->isDeclaration() ||
         StringRef(demangleName(cfn->getName())).equals("pmemobj_direct_inline") ||
         cfn->getName().contains("pmemobj_direct_inline") ||
-        cfn->getName().contains("ZL21pmemobj_direct_inline7pmemoid"))
+        cfn->getName().contains("ZL21pmemobj_direct_inline7pmemoid") ||
+        cfn->getName().contains("pmemobj_oid"))
     {         
         dbg(errs() << ">>" << cfn->getName() << " external function call...\n";)
         return doCallExternal(cb);
     }
     
     //simple verification to avoid mistakes
-    assert(!cfn->getName().contains("pmemobj_direct_"));    
+    assert(!cfn->getName().contains("pmemobj_direct_")); 
+    assert(!cfn->getName().contains("pmemobj_oid"));    
 
     dbg(errs() << ">>" << cfn->getName() << " internal function call: skipping..\n";)
     return false; 
@@ -549,7 +552,9 @@ SPPLTO::trackPtrs(Function* F)
                     }
                 }                
                 //- PM ptr -//
-                else if (CalleeF->getName().contains("pmemobj_direct")) {
+                else if (CalleeF->getName().contains("pmemobj_direct") ||
+                         CalleeF->getName().contains("pmemobj_oid")) 
+                {
                     pmemPtrs.insert(Ins);
                     dbg(errs()<<"PM ptr: "<<*Ins<<"\n";)
                     std::vector<User*> Users(Ins->user_begin(), Ins->user_end());

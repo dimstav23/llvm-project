@@ -1249,7 +1249,8 @@ namespace {
                             }
                         }                        
                         /* PM Ptrs */
-                        else if (CalleeF->getName().contains("pmemobj_direct")) 
+                        else if (CalleeF->getName().contains("pmemobj_direct") ||
+                                 CalleeF->getName().contains("pmemobj_oid")) 
                         {
                             pmemPtrs.insert(Ins);
                             dbg(errs()<<"PM ptr: "<<*Ins<<"\n";)
@@ -1537,7 +1538,8 @@ namespace {
                     continue; 
                 }
 
-                if (F->getName().contains("pmemobj_direct"))
+                if (F->getName().contains("pmemobj_direct") || 
+                    F->getName().contains("pmemobj_oid"))
                 {
                     dbg(errs() << "pmempobj direct func.. skipping\n";)
                     continue; 
