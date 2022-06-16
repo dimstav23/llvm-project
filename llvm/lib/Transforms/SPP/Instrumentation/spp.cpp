@@ -295,6 +295,7 @@ namespace {
             arglist.push_back(TmpPtr);
             arglist.push_back(GepOff);
             CallInst *Masked = B.CreateCall(hook, arglist);
+            Masked->setDoesNotThrow();
             Value *NewPtr = B.CreatePointerCast(Masked, gep->getType());
 
             int OpIdx = getOpIdx(userI, gep);
@@ -412,6 +413,7 @@ namespace {
 
             Value *TmpPtr = B.CreateBitCast(Ptr, hook.getFunctionType()->getParamType(0));
             CallInst *Masked = B.CreateCall(hook, TmpPtr);
+            Masked->setDoesNotThrow();
             Value *NewPtr = B.CreatePointerCast(Masked, Ptr->getType());
 
             int OpIdx = getOpIdx(I, Ptr);
@@ -486,7 +488,8 @@ namespace {
                     Value *TmpPtr = B.CreateBitCast(ArgVal, 
                                     hook.getFunctionType()->getParamType(0));
                     arglist.push_back(TmpPtr);
-                    CallInst *Masked = B.CreateCall(hook, arglist);                    
+                    CallInst *Masked = B.CreateCall(hook, arglist);
+                    Masked->setDoesNotThrow();                  
                     Value *Unmasked = B.CreateBitCast(Masked, ArgVal->getType()); 
 
                     CB->setArgOperand(Arg - CB->arg_begin(), Unmasked);
@@ -549,7 +552,8 @@ namespace {
                     std::vector<Value*> dest_args;
                     dest_args.push_back(DestPtr);
                     dest_args.push_back(IntOff);
-                    CallInst *DestChecked = B.CreateCall(hook, dest_args);          
+                    CallInst *DestChecked = B.CreateCall(hook, dest_args);
+                    DestChecked->setDoesNotThrow(); 
                     Value *DestCleaned = B.CreatePointerCast(DestChecked, Dest->getType());
                     MCI->setDest(DestCleaned);
 
@@ -581,7 +585,8 @@ namespace {
                     std::vector<Value*> src_args;
                     src_args.push_back(SrcPtr);
                     src_args.push_back(IntOff);
-                    CallInst *SrcChecked = B.CreateCall(hook, src_args);          
+                    CallInst *SrcChecked = B.CreateCall(hook, src_args);   
+                    SrcChecked->setDoesNotThrow();        
                     Value *SrcCleaned = B.CreatePointerCast(SrcChecked, Src->getType());
                     MCI->setSource(SrcCleaned);
 
@@ -623,7 +628,8 @@ namespace {
                     std::vector<Value*> dest_args;
                     dest_args.push_back(DestPtr);
                     dest_args.push_back(IntOff);
-                    CallInst *DestChecked = B.CreateCall(hook, dest_args);          
+                    CallInst *DestChecked = B.CreateCall(hook, dest_args); 
+                    DestChecked->setDoesNotThrow(); 
                     Value *DestCleaned = B.CreatePointerCast(DestChecked, Dest->getType());
                     MMI->setDest(DestCleaned);
 
@@ -655,7 +661,8 @@ namespace {
                     std::vector<Value*> src_args;
                     src_args.push_back(SrcPtr);
                     src_args.push_back(IntOff);
-                    CallInst *SrcChecked = B.CreateCall(hook, src_args);          
+                    CallInst *SrcChecked = B.CreateCall(hook, src_args);      
+                    SrcChecked->setDoesNotThrow();    
                     Value *SrcCleaned = B.CreatePointerCast(SrcChecked, Src->getType());
                     MMI->setSource(SrcCleaned);
 
@@ -696,7 +703,8 @@ namespace {
                     std::vector<Value*> dest_args;
                     dest_args.push_back(DestPtr);
                     dest_args.push_back(IntOff);
-                    CallInst *DestChecked = B.CreateCall(hook, dest_args);          
+                    CallInst *DestChecked = B.CreateCall(hook, dest_args);
+                    DestChecked->setDoesNotThrow();          
                     Value *DestCleaned = B.CreatePointerCast(DestChecked, Dest->getType());
                     MSI->setDest(DestCleaned);
 
@@ -785,7 +793,8 @@ namespace {
             args.push_back(TmpPtr);
             args.push_back(IntOff);
 
-            CallInst *Masked = B.CreateCall(hook, args);          
+            CallInst *Masked = B.CreateCall(hook, args);
+            Masked->setDoesNotThrow(); //to avoid it getting converted to invoke     
             Value *UpdatedPtr = B.CreatePointerCast(Masked, Gep->getType());
 
             if (pmemPtrs.find(Gep->getPointerOperand()->stripPointerCasts()) != pmemPtrs.end())
@@ -897,6 +906,7 @@ namespace {
 
             Value *TmpPtr = B.CreateBitCast(Ptr, hook.getFunctionType()->getParamType(0));
             CallInst *Masked = B.CreateCall(hook, TmpPtr);
+            Masked->setDoesNotThrow();
             Value *NewPtr = B.CreatePointerCast(Masked, Ptr->getType());
 
             dbg(errs() << ">> old ld/st: " << *I << " ptr: " << *Ptr << " stripped: " << *Ptr->stripPointerCasts() << "\n";)
@@ -1028,6 +1038,7 @@ namespace {
 
             Value *TmpPtr = B.CreateBitCast(Ptr, hook.getFunctionType()->getParamType(0));
             CallInst *Masked = B.CreateCall(hook, TmpPtr);
+            Masked->setDoesNotThrow();
             Value *NewPtr = B.CreatePointerCast(Masked, Ptr->getType());
             
             int OpIdx = getOpIdx(I, Ptr);
@@ -1215,7 +1226,8 @@ namespace {
                             }                      
                         }
                     }
-                    else if (auto *CI = dyn_cast<CallInst>(Ins)) 
+                    // CallBase to include CallInst and InvokeInst
+                    else if (auto *CI = dyn_cast<CallBase>(Ins)) 
                     { 
                         Function* CalleeF = CI->getCalledFunction();
                         if (!CalleeF) continue;

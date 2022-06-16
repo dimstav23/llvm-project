@@ -222,6 +222,7 @@ doCallFunc_LLVMDbg(CallBase *CB)
                 hook.getFunctionType()->getParamType(0));
     arglist.push_back(TmpPtr);
     CallInst *Masked = B.CreateCall(hook, arglist);
+    Masked->setDoesNotThrow(); 
     Value *Unmasked = B.CreateBitCast(Masked, ArgVal->getType()); 
     MetadataAsValue *MDAsVal= 
             MetadataAsValue::get(CB->getModule()->getContext(), 
@@ -325,6 +326,7 @@ doCallExternal(CallBase *CB)
                         hook.getFunctionType()->getParamType(0));
         arglist.push_back(TmpPtr);
         CallInst *Masked = B.CreateCall(hook, arglist);
+        Masked->setDoesNotThrow(); 
         Value *Unmasked = B.CreateBitCast(Masked, ArgVal->getType()); 
 
         CB->setArgOperand(Arg - CB->arg_begin(), Unmasked);
