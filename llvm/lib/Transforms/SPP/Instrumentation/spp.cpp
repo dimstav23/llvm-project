@@ -142,6 +142,38 @@ namespace {
             this->checkedPtrs.clear();
         }
         
+        void setSPPprefix(Value *V) {
+            // Void values can not have a name
+            if (V->getType()->isVoidTy())
+                return;
+
+            // Don't corrupt externally visable symbols
+            GlobalValue *GV = dyn_cast<GlobalValue>(V);
+            if (GV && GV->isDeclarationForLinker())
+                return;
+
+            // Don't name values that are not globals or instructions
+            if (!GV && !isa<Instruction>(V))
+                return;
+
+            // Add name to anonymous instructions
+            if (!V->hasName()) {
+                V->setName("spp.pm.anon");
+                return;
+            }
+
+            // Don't corrupt llvm.* names
+            if (V->getName().startswith("llvm."))
+                return;
+
+            // Don't rename twice
+            if (V->getName().startswith("spp."))
+                return;
+
+            // Default: prefix name with "safe."
+            V->setName(Twine("spp.pm.") + V->getName());
+        }
+
         void visitGlobals() 
         {
             SmallVector<GlobalVariable*, 16> globals;
@@ -801,7 +833,9 @@ namespace {
             {
                 dbg(errs() << "added: " << *UpdatedPtr << " ||| " << *Masked << "\n";)
                 pmemPtrs.insert(Masked);
+                setSPPprefix(Masked);
                 pmemPtrs.insert(UpdatedPtr);
+                setSPPprefix(UpdatedPtr);
             }
 
             for (auto User : Users) 
@@ -821,6 +855,7 @@ namespace {
                         case Instruction::BitCast:
                         case Instruction::GetElementPtr:
                             pmemPtrs.insert(iUser);
+                            setSPPprefix(iUser);
                         default:
                             break;
                     }
@@ -1261,11 +1296,13 @@ namespace {
                             }
                         }                        
                         /* PM Ptrs */
-                        else if (CalleeF->getName().contains("pmemobj_direct") ||
-                                 CalleeF->getName().contains("pmemobj_oid")) 
+                        else if (CalleeF->getName().contains("pmemobj_direct"))
+                                //  CalleeF->getName().contains("pmemobj_oid")) 
                         {
                             pmemPtrs.insert(Ins);
-                            dbg(errs()<<"PM ptr: "<<*Ins<<"\n";)
+                            setSPPprefix(Ins);
+                            dbg(errs()<<"PM ptr: "<<*Ins<< " Type : " << *Ins->getType() <<"\n";)
+
                             std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
                             for (auto User : Users) 
                             {
@@ -1278,6 +1315,7 @@ namespace {
                                     case Instruction::BitCast:
                                     case Instruction::GetElementPtr:
                                         pmemPtrs.insert(iUser);
+                                        setSPPprefix(iUser);
                                     default:
                                         break;
                                 }  
@@ -1317,6 +1355,7 @@ namespace {
                         if (pmemPtrs.find(Operand) != pmemPtrs.end())
                         {
                             pmemPtrs.insert(Gep);
+                            setSPPprefix(Gep);
                         }
                         else if (untaggedPtrs.find(Operand) != untaggedPtrs.end() ||
                                 globalPtrs.find(Operand) != globalPtrs.end() ||
@@ -1331,6 +1370,7 @@ namespace {
                         if (pmemPtrs.find(Operand) != pmemPtrs.end())
                         {
                             pmemPtrs.insert(Bitcast);
+                            setSPPprefix(Bitcast);
                         }
                         else if (untaggedPtrs.find(Operand) != untaggedPtrs.end() ||
                                 globalPtrs.find(Operand) != globalPtrs.end() ||
@@ -1368,6 +1408,7 @@ namespace {
                             {
                                 dbg(errs() << "persistent phi: " << *PHI << "\n";)
                                 pmemPtrs.insert(PHI);
+                                setSPPprefix(PHI);
                                 std::vector<User*> Users(PHI->user_begin(), PHI->user_end());
                                 for (auto User : Users) 
                                 {
@@ -1379,6 +1420,7 @@ namespace {
                                         case Instruction::BitCast:
                                         case Instruction::GetElementPtr:
                                             pmemPtrs.insert(iUser);
+                                            setSPPprefix(iUser);
                                         default:
                                             break;
                                     }  
@@ -1550,8 +1592,8 @@ namespace {
                     continue; 
                 }
 
-                if (F->getName().contains("pmemobj_direct") || 
-                    F->getName().contains("pmemobj_oid"))
+                if (F->getName().contains("pmemobj_direct"))
+                    // F->getName().contains("pmemobj_oid"))
                 {
                     dbg(errs() << "pmempobj direct func.. skipping\n";)
                     continue; 
