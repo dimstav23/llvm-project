@@ -84,6 +84,7 @@ struct SPPLTO : public ModulePass {
   virtual bool redundantCB(Function *F);
   virtual bool redundantTagUpdates(Function *F);
   virtual bool duplicateCleanTags(Function *F);
+  virtual bool duplicateCheckBounds(Function *F);
   virtual bool trackPtrs (Function * F);
   virtual bool runOnFunction (Function * F, Module &M);
   virtual bool runOnModule(Module &M) override;
@@ -563,15 +564,16 @@ SPPLTO::trackPtrs(Function* F)
                 }
                 //- PM ptr progataion for update tag -//
                 else if (CalleeF->getName().contains("__spp_updatetag")) {                    
-                    dbg(errs() << *Ins <<" Arg: " << *CI->getArgOperand(0) << "\n";)
+                    dbg(errs() << "update tag prop candidate : " << *Ins <<" Arg: " << *CI->getArgOperand(0)->stripPointerCasts() << "\n";)
                     // get the update tag argument
                     Value *ArgVal = dyn_cast<Value>(CI->getArgOperand(0));
                     
                     if (ArgVal && ArgVal->getType()->isPointerTy())
                     {
-                        if ( pmemPtrs.find(ArgVal->stripPointerCasts()) != pmemPtrs.end() )
+                        if (pmemPtrs.find(ArgVal->stripPointerCasts()) != pmemPtrs.end())
                         {
                             pmemPtrs.insert(Ins);
+                            dbg(errs() << "update tag prop: "  <<*Ins <<" Arg: " << *CI->getArgOperand(0) << "\n";)
                             std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
                             for (auto User : Users) 
                             {
@@ -671,6 +673,46 @@ SPPLTO::duplicateCleanTags(Function *FN)
             }
         }
         cleanedVals.clear();
+    }
+    return changed;
+}
+
+bool
+SPPLTO::duplicateCheckBounds(Function *FN)
+{
+    bool changed = false;
+    
+    for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
+    {
+        DenseMap<Value*, Value*> checkedVals;
+        for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
+        { 
+            if (auto cb = dyn_cast<CallInst>(ins)) 
+            {
+                Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
+                if (cfn)
+                {
+                    // Check for redundant updatetag calls that are directly cleaned
+                    if (cfn->getName().contains("__spp_checkbound"))
+                    {
+                        Value* ArgVal = cb->getOperand(0)->stripPointerCasts();
+                        if (checkedVals.find(ArgVal) == checkedVals.end()) 
+                        {
+                            checkedVals[ArgVal] = cb;
+                            dbg(errs() << *cb << " op : " << *ArgVal << "\n";)  
+                        }
+                        else 
+                        {
+                            errs() << *cb << " duplicate checkbound : " << *ArgVal << "\n";
+                            dbg(errs() << "should be replaced with: " << *checkedVals[ArgVal] << "\n";)
+                            cb->replaceAllUsesWith(checkedVals[ArgVal]);
+                            redundantChecks.push_back(cb);
+                        }
+                    }
+                }
+            }
+        }
+        checkedVals.clear();
     }
     return changed;
 }
@@ -940,6 +982,15 @@ SPPLTO::runOnModule(Module &M)
     for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
     { 
         duplicateCleanTags(&*Fn);
+    }
+
+    if (!hasZeroRedundantChecks()){
+        eraseRedundantChecks();
+    }
+
+    for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+    { 
+        duplicateCheckBounds(&*Fn);
     }
 
     if (!hasZeroRedundantChecks()){
