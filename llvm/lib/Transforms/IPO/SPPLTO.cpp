@@ -47,6 +47,7 @@
 #include <algorithm>
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
+#include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "../lib/IR/ConstantsContext.h"
@@ -160,6 +161,38 @@ demangleName(StringRef str)
     return result;    
 }
 
+void setSPPprefix(Value *V) {
+    // Void values can not have a name
+    if (V->getType()->isVoidTy())
+        return;
+            
+    // Don't corrupt externally visable symbols
+    GlobalValue *GV = dyn_cast<GlobalValue>(V);
+    if (GV && GV->isDeclarationForLinker())
+        return;
+
+    // Don't name values that are not globals or instructions
+    if (!GV && !isa<Instruction>(V))
+        return;
+
+    // Add name to anonymous instructions
+    if (!V->hasName()) {
+        V->setName("spp.pm.anon");
+        return;
+    }
+
+    // Don't corrupt llvm.* names
+    if (V->getName().startswith("llvm."))
+        return;
+
+    // Don't rename twice
+    if (V->getName().startswith("spp."))
+        return;
+
+    // Default: prefix name with "safe."
+    V->setName(Twine("spp.pm.") + V->getName());
+}
+
 static bool hasZeroRedundantChecks()
 {
     return redundantChecks.empty();
@@ -247,8 +280,7 @@ doCallExternal(CallBase *CB)
     }
 
     if (CB->getCalledFunction() != NULL &&
-        !CB->getCalledFunction()->getName().contains("pmemobj_direct") &&
-        !CB->getCalledFunction()->getName().contains("pmemobj_oid"))
+        !CB->getCalledFunction()->getName().contains("pmemobj_direct"))
     {
         Value *CBval = dyn_cast<Value>(CB);
         if (CBval)
@@ -368,16 +400,14 @@ doCallFunction(CallBase *cb, Function *cfn)
     if (cfn->isDeclaration() ||
         StringRef(demangleName(cfn->getName())).equals("pmemobj_direct_inline") ||
         cfn->getName().contains("pmemobj_direct_inline") ||
-        cfn->getName().contains("ZL21pmemobj_direct_inline7pmemoid") ||
-        cfn->getName().contains("pmemobj_oid"))
+        cfn->getName().contains("ZL21pmemobj_direct_inline7pmemoid"))
     {         
         dbg(errs() << ">>" << cfn->getName() << " external function call...\n";)
         return doCallExternal(cb);
     }
     
     //simple verification to avoid mistakes
-    assert(!cfn->getName().contains("pmemobj_direct_")); 
-    assert(!cfn->getName().contains("pmemobj_oid"));    
+    assert(!cfn->getName().contains("pmemobj_direct_"));
 
     dbg(errs() << ">>" << cfn->getName() << " internal function call: skipping..\n";)
     return false; 
@@ -502,6 +532,8 @@ SPPLTO::trackPtrs(Function* F)
                 if (isAllocLikeFn(CI, getTLI(*CalleeF)) ||
                     isReallocLikeFn(CI, getTLI(*CalleeF)) ||
                     CalleeF->getName().contains("__errno_location") ||
+                    CalleeF->getName().equals("_Znwm") || //new cpp
+                    CalleeF->getName().equals("_Znam") || //new cpp
                     CalleeF->getName().startswith("__cxa_")) 
                 {
                     untaggedPtrs.insert(Ins);
@@ -526,6 +558,33 @@ SPPLTO::trackPtrs(Function* F)
                         }  
                     }
                 }
+                // Arguments of a free call are volatile ptrs
+                else if (isFreeCall(CI, getTLI(*CalleeF)) ||
+                         CalleeF->getName().equals("_ZdlPv")) //free cpp
+                {
+                    Value *Operand = Ins->getOperand(0)->stripPointerCasts();
+                    dbg(errs()<<"call to free ptr: " << *Ins << "\n";)
+                    untaggedPtrs.insert(Operand);
+
+                    std::vector<User*> Users(Operand->user_begin(), Operand->user_end());
+                    for (auto User : Users) 
+                    {
+                        Instruction *iUser= dyn_cast<Instruction>(User);
+                        dbg(errs() << ">>vol ptr use: " << *iUser << "\n";)
+
+                        // mark directly derived values as volatile:
+                        switch (iUser->getOpcode()) 
+                        {
+                            case Instruction::BitCast:
+                            case Instruction::PtrToInt:
+                            case Instruction::IntToPtr:
+                            case Instruction::GetElementPtr:
+                                untaggedPtrs.insert(iUser);
+                            default:
+                                break;
+                        }  
+                    }
+                } 
                 //- already cleaned ptr -//
                 if (CalleeF->getName().contains("__spp_cleantag") ||
                     CalleeF->getName().contains("__spp_memintr_check_and_clean") ||
@@ -554,11 +613,12 @@ SPPLTO::trackPtrs(Function* F)
                     }
                 }                
                 //- PM ptr -//
-                else if (CalleeF->getName().contains("pmemobj_direct") ||
-                         CalleeF->getName().contains("pmemobj_oid")) 
+                else if (CalleeF->getName().contains("pmemobj_direct"))// ||
+                        //  CalleeF->getName().contains("spp_new_get")) 
                 {
                     pmemPtrs.insert(Ins);
-                    dbg(errs()<<"PM ptr: "<<*Ins<<"\n";)
+                    setSPPprefix(Ins);
+                    dbg(errs()<<"LTO PM ptr: "<<*Ins<<"\n";)
                     std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
                     for (auto User : Users) 
                     {
@@ -571,6 +631,7 @@ SPPLTO::trackPtrs(Function* F)
                             case Instruction::BitCast:
                             case Instruction::GetElementPtr:
                                 pmemPtrs.insert(iUser);
+                                setSPPprefix(iUser);
                             default:
                                 break;
                         }  
@@ -587,6 +648,7 @@ SPPLTO::trackPtrs(Function* F)
                         if (pmemPtrs.find(ArgVal->stripPointerCasts()) != pmemPtrs.end())
                         {
                             pmemPtrs.insert(Ins);
+                            setSPPprefix(Ins);
                             dbg(errs() << "update tag prop: "  <<*Ins <<" Arg: " << *CI->getArgOperand(0) << "\n";)
                             std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
                             for (auto User : Users) 
@@ -600,6 +662,7 @@ SPPLTO::trackPtrs(Function* F)
                                     case Instruction::BitCast:
                                     case Instruction::GetElementPtr:
                                         pmemPtrs.insert(iUser);
+                                        setSPPprefix(iUser);
                                     default:
                                         break;
                                 }  
@@ -641,6 +704,7 @@ SPPLTO::trackPtrs(Function* F)
                 if (pmemPtrs.find(Operand) != pmemPtrs.end())
                 {
                     pmemPtrs.insert(Gep);
+                    setSPPprefix(Gep);
                 }
                 else if (untaggedPtrs.find(Operand) != untaggedPtrs.end() ||
                          globalPtrs.find(Operand) != globalPtrs.end() ||
@@ -656,6 +720,7 @@ SPPLTO::trackPtrs(Function* F)
                 if (pmemPtrs.find(Operand) != pmemPtrs.end())
                 {
                     pmemPtrs.insert(Bitcast);
+                    setSPPprefix(Bitcast);
                 }
                 else if (untaggedPtrs.find(Operand) != untaggedPtrs.end() ||
                          globalPtrs.find(Operand) != globalPtrs.end() ||
@@ -694,6 +759,7 @@ SPPLTO::trackPtrs(Function* F)
                     {
                         dbg(errs() << "persistent phi: " << *PHI << "\n";)
                         pmemPtrs.insert(PHI);
+                        setSPPprefix(PHI);
                         std::vector<User*> Users(PHI->user_begin(), PHI->user_end());
                         for (auto User : Users) 
                         {
@@ -705,6 +771,7 @@ SPPLTO::trackPtrs(Function* F)
                                 case Instruction::BitCast:
                                 case Instruction::GetElementPtr:
                                     pmemPtrs.insert(iUser);
+                                    setSPPprefix(iUser);
                                 default:
                                 break;
                             }  
@@ -838,7 +905,7 @@ SPPLTO::duplicateCheckBounds(Function *FN)
                         }
                         else 
                         {
-                            errs() << *cb << " duplicate checkbound : " << *ArgVal << "\n";
+                            dbg(errs() << *cb << " duplicate checkbound : " << *ArgVal << "\n";)
                             dbg(errs() << "should be replaced with: " << *checkedVals[ArgVal] << "\n";)
                             cb->replaceAllUsesWith(checkedVals[ArgVal]);
                             redundantChecks.push_back(cb);
@@ -930,6 +997,13 @@ SPPLTO::redundantCB(Function *FN)
                         cfn->getName().contains("__spp_cleantag"))
                     {
                         dbg(errs() << ">>CallBase: "<<*cb<<"\n";)
+    
+                        if (cb->getNumUses() == 0){
+                            dbg(errs() << "no use :" << *cb << "\n";)
+                            redundantChecks.push_back(cb);
+                            continue;
+                        }
+
                         for (auto Arg = cb->arg_begin(); Arg != cb->arg_end(); ++Arg) 
                         {   
                             Value *ArgVal = dyn_cast<Value>(Arg);
@@ -980,9 +1054,110 @@ SPPLTO::redundantCB(Function *FN)
                                 redundantChecks.push_back(cb);
                                 break;
                             }
+                            else if (pmemPtrs.find(ArgVal->stripPointerCasts()) != pmemPtrs.end())
+                            {
+                                dbg(errs() << *cb << " could have been direct\n";)
+                                if (!cfn->getName().endswith("_direct")) 
+                                {
+                                    IRBuilder<> B(cb);
+                                    Module *mod = cb->getModule();
+                                    StringRef FnName;
+                                    if (cfn->getName().equals("__spp_checkbound"))
+                                        FnName = "__spp_checkbound_direct";
+                                    else if (cfn->getName().equals("__spp_updatetag"))
+                                        FnName = "__spp_updatetag_direct";
+                                    else if (cfn->getName().equals("__spp_cleantag"))
+                                        FnName = "__spp_cleantag_direct";
+                                    else if (cfn->getName().equals("__spp_cleantag_external"))
+                                        FnName = "__spp_cleantag_external_direct";
+                                    
+                                    FunctionType *fty = cfn->getFunctionType();
+                                    FunctionCallee hook = mod->getOrInsertFunction(FnName, fty); 
+                                    vector <Value*> arglist(cb->arg_begin(), cb->arg_end());
+                                    CallInst *NewCI = B.CreateCall(hook, arglist);                         
+                                    NewCI->setDoesNotThrow();
+
+                                    if (!cb->use_empty())
+                                        cb->replaceAllUsesWith(NewCI);
+                                    // ReplaceInstWithInst(cb, NewCI);
+                                    redundantChecks.push_back(cb);
+                                    pmemPtrs.insert(NewCI);
+                                }
+
+                            }
                             else 
                             {
-                                dbg(errs() << ">>remaining CallBase: "<<*cb<<"\n";)
+                                dbg(errs() << ">>Remaining callbase : " << *cb << " Uses: " \
+                                            << cb->getNumUses() << " argval: " << *ArgVal << "\n";)
+                            }
+                        }
+                    }
+                }
+            }
+            else if (auto cb = dyn_cast<InvokeInst>(ins))
+            {
+                Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
+                if (cfn)
+                {
+                    if (cfn->getName().contains("__spp_checkbound") ||
+                        cfn->getName().contains("__spp_updatetag") || 
+                        cfn->getName().contains("__spp_cleantag"))
+                    {
+                        // errs() << ">>InvokeInst: "<<*cb<<"\n";
+                        for (auto Arg = cb->arg_begin(); Arg != cb->arg_end(); ++Arg) 
+                        {   
+                            Value *ArgVal = dyn_cast<Value>(Arg);
+                            if (!ArgVal) 
+                            {
+                                dbg(errs() << ">>Argument skipping.. Not a value\n";)
+                                continue;
+                            }
+                            
+                            // Now we got a Value arg. 
+                            if (!ArgVal->getType()->isPointerTy()) 
+                            {
+                                dbg(errs()<<">>Argument skipping.. Not pointerType\n";)
+                                continue;
+                            }
+
+                            // stripPointerCasts() is needed to identify untracked bitcasts
+                            if ( extPtrs.find(ArgVal->stripPointerCasts()) != extPtrs.end() ||
+                                 globalPtrs.find(ArgVal->stripPointerCasts()) != globalPtrs.end() ||
+                                 untaggedPtrs.find(ArgVal->stripPointerCasts()) != untaggedPtrs.end() ||
+                                 vtPtrs.find(ArgVal->stripPointerCasts()) != vtPtrs.end() )
+                            {   
+                                //replace uses of the returned value with ArgVal
+                                //and remove the function call
+                                dbg(errs() << ">>InvokeInst ext or vol ptr -- should skip : " << *cb << " Uses: " \
+                                            << cb->getNumUses() << " argval: " << *ArgVal << "\n";)
+                                cb->replaceAllUsesWith(ArgVal);
+
+                                std::vector<User*> Users(ArgVal->user_begin(), ArgVal->user_end());
+                                for (auto User : Users) 
+                                {
+                                    Instruction *iUser= dyn_cast<Instruction>(User);
+                                    dbg(errs() << ">>New external ptr use: " << *iUser << "\n";)
+
+                                    // mark new directly derived values as external:
+                                    switch (iUser->getOpcode()) 
+                                    {
+                                        case Instruction::BitCast:
+                                        case Instruction::PtrToInt:
+                                        case Instruction::IntToPtr:
+                                        case Instruction::GetElementPtr:
+                                            extPtrs.insert(iUser);
+                                        default:
+                                            break;
+                                    }                      
+                                }
+
+                                // redundantChecks.push_back(cb);
+                                break;
+                            }
+                            else 
+                            {
+                                dbg(errs() << ">>Remaining InvokeInst : " << *cb << " Uses: " \
+                                            << cb->getNumUses() << " argval: " << *ArgVal << "\n";)
                             }
                         }
                     }
@@ -1015,7 +1190,7 @@ bool
 SPPLTO::runOnModule(Module &M)
 {    
     errs() << ">>Starting SPPLTO pass\n";
-    errs() << ">>" << __func__ << " : " << M.getModuleIdentifier() << "\n";
+    dbg(errs() << ">>" << __func__ << " : " << M.getModuleIdentifier() << "\n";)
     
     /*
     * DO NOT DELETE the following lines,
@@ -1028,7 +1203,7 @@ SPPLTO::runOnModule(Module &M)
 
     if (!M.getFunction("main")) 
     {
-        errs() << "!>ALERT: No main found in module\n";
+        dbg(errs() << "!>ALERT: No main found in module\n";)
         // for (auto curFref = M.getFunctionList().begin(), 
         //     endFref = M.getFunctionList().end(); 
         //     curFref != endFref; ++curFref) {
@@ -1068,6 +1243,8 @@ SPPLTO::runOnModule(Module &M)
 
     }
 
+    // errs() << M << "\n";
+    
     for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
     {
         trackPtrs(&*Fn);
@@ -1143,7 +1320,7 @@ SPPLTO::runOnModule(Module &M)
     //     }
     // }
 
-    // errs() << M << "\n";
+    dbg(errs() << M << "\n";)
     
     memCleanUp();
 
