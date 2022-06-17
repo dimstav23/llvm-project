@@ -1255,6 +1255,7 @@ namespace {
                                 case Instruction::PtrToInt:
                                 case Instruction::IntToPtr:
                                 case Instruction::GetElementPtr:
+                                    dbg(errs() << ">>Local ptr use: " << *iUser << "\n";)
                                     untaggedPtrs.insert(iUser);
                                 default:
                                     break;
@@ -1294,9 +1295,36 @@ namespace {
                                         break;
                                 }  
                             }
-                        }                        
+                        }
+                        // Arguments of a free call are volatile ptrs
+                        else if (isFreeCall(CI, getTLI(*CalleeF)))
+                        {
+                            Value *Operand = Ins->getOperand(0)->stripPointerCasts();
+                            dbg(errs()<<"call to free ptr: " << *Ins << "\n";)
+                            untaggedPtrs.insert(Operand);
+
+                            std::vector<User*> Users(Operand->user_begin(), Operand->user_end());
+                            for (auto User : Users) 
+                            {
+                                Instruction *iUser= dyn_cast<Instruction>(User);
+                                dbg(errs() << ">>vol ptr use: " << *iUser << "\n";)
+
+                                // mark directly derived values as volatile:
+                                switch (iUser->getOpcode()) 
+                                {
+                                    case Instruction::BitCast:
+                                    case Instruction::PtrToInt:
+                                    case Instruction::IntToPtr:
+                                    case Instruction::GetElementPtr:
+                                        untaggedPtrs.insert(iUser);
+                                    default:
+                                        break;
+                                }  
+                            }
+                        }                  
                         /* PM Ptrs */
-                        else if (CalleeF->getName().contains("pmemobj_direct"))
+                        else if (CalleeF->getName().contains("pmemobj_direct")) //||
+                                //  CalleeF->getName().contains("spp_new_get"))
                                 //  CalleeF->getName().contains("pmemobj_oid")) 
                         {
                             pmemPtrs.insert(Ins);
@@ -1314,6 +1342,7 @@ namespace {
                                 {
                                     case Instruction::BitCast:
                                     case Instruction::GetElementPtr:
+                                        dbg(errs() << ">>pm ptr use: " << *iUser << "\n";)
                                         pmemPtrs.insert(iUser);
                                         setSPPprefix(iUser);
                                     default:
@@ -1530,7 +1559,7 @@ namespace {
             //         // }
             //     }
             // }
-
+            dbg(errs() << M << "\n";)
             //Track global ptrs
             for (auto GV = M.global_begin(); GV!=M.global_end(); GV++) 
             {
@@ -1575,6 +1604,8 @@ namespace {
 
                 dbg(errs() << "Internal.. processing\n";)
                 changed = Spp.trackPtrs(&*F);
+
+                // errs() << F->getName() << " ret : " << *F->getReturnType() << "\n";
             }
             //Visit the functions to clear the appropriate ptr before external calls
             for (auto F = M.begin(), Fend = M.end(); F != Fend; ++F) 
@@ -1620,6 +1651,8 @@ namespace {
             //         // }
             //     }
             // }
+            dbg(errs() << M << "\n";)
+            
             Spp.memCleanUp();
             return changed;
         }
