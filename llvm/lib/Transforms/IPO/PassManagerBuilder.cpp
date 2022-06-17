@@ -1051,6 +1051,9 @@ void PassManagerBuilder::addLTOOptimizationPasses(legacy::PassManagerBase &PM) {
   if (OptLevel > 1)
     PM.add(createTailCallEliminationPass());
 
+  /// SPP. SPPLTO.
+  PM.add(createSPPLTOPass());
+
   // Infer attributes on declarations, call sites, arguments, etc.
   PM.add(createPostOrderFunctionAttrsLegacyPass()); // Add nocapture.
   // Run a few AA driven optimizations here and now, to cleanup the code.
