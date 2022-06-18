@@ -161,7 +161,7 @@ demangleName(StringRef str)
     return result;    
 }
 
-void setSPPprefix(Value *V) {
+static void setSPPprefix(Value *V) {
     // Void values can not have a name
     if (V->getType()->isVoidTy())
         return;
@@ -204,7 +204,7 @@ static void eraseRedundantChecks()
     for (unsigned i=0; i < redundantChecks.size(); i++) {
         Instruction * eraseI = redundantChecks.at(i);
         dbg(errs()<<i<<">>ERASE: "<< *eraseI <<"\n";)
-        eraseI->eraseFromParent(); 
+        eraseI->eraseFromParent();
     }
     dbg(errs()<<">>ERASE_done\n";)
     redundantChecks.clear();
@@ -364,6 +364,7 @@ doCallExternal(CallBase *CB)
         CB->setArgOperand(Arg - CB->arg_begin(), Unmasked);
 
         dbg(errs() << ">>new_CB after masking: " << *CB << "\n";)
+        dbg(errs() << "inserted : " << *Masked << " in " << CB->getFunction()->getName() << "\n";)
 
         changed = true;
     }
@@ -377,8 +378,7 @@ doCallNonFunc(CallBase *cb)
     return doCallExternal(cb);
 }
 
-static bool
-doCallFunction(CallBase *cb, Function *cfn)
+static bool doCallFunction(CallBase *cb, Function *cfn)
 {
     assert(cfn);
    
@@ -391,7 +391,7 @@ doCallFunction(CallBase *cb, Function *cfn)
         return false;
     }
     
-    // Ignore exception handling calls
+    // Ignore exception handling calls and free calls
     if (cfn->getName().startswith("__cxa_"))
     {
         return false;
@@ -560,33 +560,40 @@ SPPLTO::trackPtrs(Function* F)
                 }
                 // Arguments of a free call are volatile ptrs
                 else if (isFreeCall(CI, getTLI(*CalleeF)) ||
-                         CalleeF->getName().equals("_ZdlPv")) //free cpp
+                         CalleeF->getName().equals("_ZdlPv") || //free cpp
+                         CalleeF->getName().equals("_ZdaPv")) //free cpp
                 {
                     Value *Operand = Ins->getOperand(0)->stripPointerCasts();
-                    dbg(errs()<<"call to free ptr: " << *Ins << "\n";)
-                    untaggedPtrs.insert(Operand);
-
-                    std::vector<User*> Users(Operand->user_begin(), Operand->user_end());
-                    for (auto User : Users) 
+                    dbg(errs()<<"call to free ptr: " << *Ins << " Op : " << *Operand << "\n";)
+                    
+                    // This check exists for the case of a mid-pipeline optimization pass
+                    // where free func can get null argument before being eliminated
+                    if (!isa<ConstantPointerNull>(Operand))
                     {
-                        Instruction *iUser= dyn_cast<Instruction>(User);
-                        dbg(errs() << ">>vol ptr use: " << *iUser << "\n";)
+                        untaggedPtrs.insert(Operand);
 
-                        // mark directly derived values as volatile:
-                        switch (iUser->getOpcode()) 
+                        std::vector<User*> Users(Operand->user_begin(), Operand->user_end());
+                        for (auto User : Users) 
                         {
-                            case Instruction::BitCast:
-                            case Instruction::PtrToInt:
-                            case Instruction::IntToPtr:
-                            case Instruction::GetElementPtr:
-                                untaggedPtrs.insert(iUser);
-                            default:
-                                break;
-                        }  
+                            Instruction *iUser= dyn_cast<Instruction>(User);
+                            dbg(errs() << ">>vol ptr use: " << *iUser << "\n";)
+
+                            // mark directly derived values as volatile:
+                            switch (iUser->getOpcode()) 
+                            {
+                                case Instruction::BitCast:
+                                case Instruction::PtrToInt:
+                                case Instruction::IntToPtr:
+                                case Instruction::GetElementPtr:
+                                    untaggedPtrs.insert(iUser);
+                                default:
+                                    break;
+                            }  
+                        }
                     }
                 } 
                 //- already cleaned ptr -//
-                if (CalleeF->getName().contains("__spp_cleantag") ||
+                else if (CalleeF->getName().contains("__spp_cleantag") ||
                     CalleeF->getName().contains("__spp_memintr_check_and_clean") ||
                     CalleeF->getName().contains("__spp_checkbound")) 
                 {
@@ -1000,6 +1007,7 @@ SPPLTO::redundantCB(Function *FN)
     
                         if (cb->getNumUses() == 0){
                             dbg(errs() << "no use :" << *cb << "\n";)
+                            dbg(errs() << "added " << *cb << " from " << FN->getName() << "\n";)
                             redundantChecks.push_back(cb);
                             continue;
                         }
@@ -1045,12 +1053,12 @@ SPPLTO::redundantCB(Function *FN)
                                         case Instruction::PtrToInt:
                                         case Instruction::IntToPtr:
                                         case Instruction::GetElementPtr:
-                                            extPtrs.insert(iUser);
+                                            untaggedPtrs.insert(iUser);
                                         default:
                                             break;
                                     }                      
                                 }
-
+                                dbg(errs() << "added " << *cb << " from " << FN->getName() << "\n";)
                                 redundantChecks.push_back(cb);
                                 break;
                             }
@@ -1080,6 +1088,7 @@ SPPLTO::redundantCB(Function *FN)
                                     if (!cb->use_empty())
                                         cb->replaceAllUsesWith(NewCI);
                                     // ReplaceInstWithInst(cb, NewCI);
+                                    dbg(errs() << "added " << *cb << " from " << FN->getName() << "\n";)
                                     redundantChecks.push_back(cb);
                                     pmemPtrs.insert(NewCI);
                                 }
@@ -1130,7 +1139,7 @@ SPPLTO::redundantCB(Function *FN)
                                 //and remove the function call
                                 dbg(errs() << ">>InvokeInst ext or vol ptr -- should skip : " << *cb << " Uses: " \
                                             << cb->getNumUses() << " argval: " << *ArgVal << "\n";)
-                                cb->replaceAllUsesWith(ArgVal);
+                                // cb->replaceAllUsesWith(ArgVal);
 
                                 std::vector<User*> Users(ArgVal->user_begin(), ArgVal->user_end());
                                 for (auto User : Users) 
@@ -1145,7 +1154,7 @@ SPPLTO::redundantCB(Function *FN)
                                         case Instruction::PtrToInt:
                                         case Instruction::IntToPtr:
                                         case Instruction::GetElementPtr:
-                                            extPtrs.insert(iUser);
+                                            untaggedPtrs.insert(iUser);
                                         default:
                                             break;
                                     }                      
@@ -1273,6 +1282,8 @@ SPPLTO::runOnModule(Module &M)
         runOnFunction(&*Fn, M);
     }
 
+    // errs() << M << "\n";
+
     for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
     { 
         redundantCB(&*Fn);
@@ -1320,7 +1331,7 @@ SPPLTO::runOnModule(Module &M)
     //     }
     // }
 
-    dbg(errs() << M << "\n";)
+    // errs() << M << "\n";
     
     memCleanUp();
 
