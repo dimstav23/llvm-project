@@ -43,6 +43,7 @@
 #include <llvm/Transforms/Utils/Local.h>
 #include "llvm/Transforms/SPP/SPPUtils.h"
 
+#include <cxxabi.h>
 #include <iostream>
 #include <map>
 #include <set>
@@ -90,14 +91,14 @@ namespace {
             VOL,
             PM,
             CONST,
-            UKNOWN
+            UKNOWN,
+            MAX_TYPE
         };
 
     public:
         std::unordered_set <Value*> globalPtrs;
         std::unordered_set <Value*> untaggedPtrs;
         std::unordered_set <Value*> pmemPtrs;
-        std::unordered_set <Value*> extPtrs;
 
         std::unordered_set <Value*> vtPtrs;
         std::unordered_set <Value*> cxaPtrs;
@@ -105,6 +106,8 @@ namespace {
 
         std::vector<Instruction*> GEP_hooked_CBs;
         std::vector<Instruction*> GEP_skipped_CBs;
+
+        DenseMap<Value*, operandType> FnArgType;
     
         SPPPass(Module* M) 
         {
@@ -136,13 +139,29 @@ namespace {
             this->globalPtrs.clear();
             this->untaggedPtrs.clear();
             this->pmemPtrs.clear();
-            this->extPtrs.clear();
             this->vtPtrs.clear();
             this->cxaPtrs.clear();
             this->checkedPtrs.clear();
+            this->FnArgType.clear();
+        }
+
+        std::string demangleName(StringRef str)
+        {
+            std::string result = "";
+            int unmangledStatus;
+            
+            char *unmangledName = abi::__cxa_demangle(
+                str.data(), nullptr, nullptr, &unmangledStatus);
+            if (unmangledStatus == 0) 
+            {
+                std::string unmangledNameStr(unmangledName);
+                result = unmangledNameStr;
+            }
+            return result;    
         }
         
-        void setSPPprefix(Value *V) {
+        void setSPPprefix(Value *V) 
+        {
             // Void values can not have a name
             if (V->getType()->isVoidTy())
                 return;
@@ -759,6 +778,13 @@ namespace {
                 dbg(errs() << ">>GEP: Zero Indices.. skipping...\n";)
                 return false;
             }
+
+            if (isa<Constant>(Gep) || 
+                isa<Constant>(Gep->getPointerOperand()->stripPointerCasts())) 
+            {
+                dbg(errs() << ">>GEP: Constant.. skipping...\n";)
+                return false;
+            }
                     
             /* We want to skip GEPs on vtable stuff, as they shouldn't be able to
             * overflow, and because they don't have metadata normally negative
@@ -827,7 +853,7 @@ namespace {
 
             CallInst *Masked = B.CreateCall(hook, args);
             Masked->setDoesNotThrow(); //to avoid it getting converted to invoke     
-            Value *UpdatedPtr = B.CreatePointerCast(Masked, Gep->getType());
+            Value *UpdatedPtr = B.CreatePointerCast(Masked, Gep->getType());          
 
             if (pmemPtrs.find(Gep->getPointerOperand()->stripPointerCasts()) != pmemPtrs.end())
             {
@@ -1195,7 +1221,165 @@ namespace {
             return changed;
         }
 
-        bool trackPtrs(Function* F) 
+        void assessPtrArgs(Module* M)
+        {
+            // initially add the args to their respective categories
+            for (auto it : FnArgType)
+            {
+                Value* ArgVal= it.first;
+                operandType Type = it.second;
+
+                if (Type == PM)
+                {
+                    dbg(errs() << "PM argument found " << *ArgVal << "\n";)
+                    pmemPtrs.insert(ArgVal);
+                    setSPPprefix(ArgVal);
+
+                }
+                else if (Type == VOL)
+                {
+                    dbg(errs() << "VOL argument found " << *ArgVal << "\n";)
+                    untaggedPtrs.insert(ArgVal);
+                    std::vector<User*> Users(ArgVal->user_begin(), ArgVal->user_end());
+                    for (auto User : Users) 
+                    {
+                        Instruction *iUser= dyn_cast<Instruction>(User);
+                        // mark directly derived values as volatile:
+                        switch (iUser->getOpcode()) 
+                        {
+                            case Instruction::BitCast:
+                            case Instruction::PtrToInt:
+                            case Instruction::IntToPtr:
+                            case Instruction::GetElementPtr:
+                                dbg(errs() << ">>VOL argument ptr use: " << *iUser << "\n";)
+                                untaggedPtrs.insert(iUser);
+                            default:
+                                break;
+                        }                      
+                    }
+                }
+            }
+
+            //go through the code again to completely propagate through subsequent bitcasts and GEPs
+            for (auto F = M->begin(), Fend = M->end(); F != Fend; ++F) 
+            {
+                for (auto BB= F->begin(); BB!= F->end(); ++BB)
+                {
+                    for (auto II = BB->begin(); II != BB->end(); ++II) 
+                    {
+                        Instruction* Ins= &*II;
+                        if (auto *Gep = dyn_cast<GetElementPtrInst>(Ins)) 
+                        {
+                            Value *Operand = Gep->getPointerOperand()->stripPointerCasts();
+                            if (pmemPtrs.find(Operand) != pmemPtrs.end())
+                            {
+                                dbg(errs() << "new pm ptr\n";)
+                                pmemPtrs.insert(Gep);
+                                setSPPprefix(Gep);
+                            }
+                            else if (untaggedPtrs.find(Operand) != untaggedPtrs.end() ||
+                                    globalPtrs.find(Operand) != globalPtrs.end() ||
+                                    vtPtrs.find(Operand) != vtPtrs.end())
+                            {
+                                dbg(errs() << "new vol ptr\n";)
+                                untaggedPtrs.insert(Gep);
+                            }
+                        }
+                        else if (auto *Bitcast = dyn_cast<BitCastInst>(Ins)) 
+                        {
+                            Value *Operand = Bitcast->getOperand(0)->stripPointerCasts();
+                            if (pmemPtrs.find(Operand) != pmemPtrs.end())
+                            {
+                                dbg(errs() << "new pm ptr\n";)
+                                pmemPtrs.insert(Bitcast);
+                                setSPPprefix(Bitcast);
+                            }
+                            else if (untaggedPtrs.find(Operand) != untaggedPtrs.end() ||
+                                    globalPtrs.find(Operand) != globalPtrs.end() ||
+                                    vtPtrs.find(Operand) != vtPtrs.end())
+                            {
+                                dbg(errs() << "new vol ptr\n";)
+                                untaggedPtrs.insert(Bitcast);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        void propagateFnArgsTypes(Function* F) 
+        {
+            for (auto BI= F->begin(); BI!= F->end(); ++BI) 
+            {
+                BasicBlock *BB = &*BI; 
+
+                for (auto II = BB->begin(); II != BB->end(); ++II) 
+                {
+                    Instruction* Ins= &*II;
+                    // CallBase to include CallInst and InvokeInst
+                    if (auto *CI = dyn_cast<CallBase>(Ins))
+                    {   
+                        dbg(errs() << "call :" << *CI << "\n";)
+                        for (auto Arg = CI->arg_begin(); Arg != CI->arg_end(); ++Arg) 
+                        {
+                            Value *ArgVal = dyn_cast<Value>(Arg);
+                            if (ArgVal->getType()->isPointerTy())
+                            {
+                                unsigned argIdx = CI->getArgOperandNo(Arg);
+                                dbg(errs() << "PtrArg: " << *ArgVal->stripPointerCasts() << " in position " << argIdx <<"\n";)
+                                Function* CalleeF = CI->getCalledFunction();
+
+                                if (!CalleeF || CalleeF->isDeclaration()) continue; // external funcs, cleaned anyway
+                                if (CalleeF->arg_size() <= argIdx) continue; // functions with arbitrary args cannot be tracked
+                                
+                                if (pmemPtrs.find(ArgVal->stripPointerCasts()) != pmemPtrs.end())
+                                {
+                                    Value* FnArg = CalleeF->getArg(argIdx);
+                                    if (FnArgType[FnArg] == MAX_TYPE)
+                                        FnArgType[FnArg] = PM;
+                                    else if (FnArgType[FnArg] != PM)
+                                        FnArgType[FnArg] = UKNOWN;
+                                }
+                                else if (untaggedPtrs.find(ArgVal->stripPointerCasts()) != untaggedPtrs.end() ||
+                                         globalPtrs.find(ArgVal->stripPointerCasts()) != globalPtrs.end() ||
+                                         vtPtrs.find(ArgVal->stripPointerCasts()) != vtPtrs.end())
+                                {
+                                    Value* FnArg = CalleeF->getArg(argIdx);
+                                    if (FnArgType[FnArg] == MAX_TYPE)
+                                        FnArgType[FnArg] = VOL;
+                                    else if (FnArgType[FnArg] != VOL)
+                                        FnArgType[FnArg] = UKNOWN;
+                                }
+                                dbg(Value* FnArg = CalleeF->getArg(argIdx);)
+                                dbg(errs() << "FnArg: " << *FnArg << " type : " << FnArgType[FnArg] << "\n";)
+                                dbg(errs() << "Function :" << CalleeF->getName() << "\n";)
+                                dbg(errs() << "respective arg: " << *CalleeF->getArg(argIdx) << "\n";)
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        void trackFnArgs(Function* F) 
+        {
+            dbg(errs() << "Function: " << demangleName(F->getName()) << " with " << F->arg_size() << " argument(s): \n";)
+            dbg(errs() << "real fname: " << F->getName() << "\n";)
+            for (auto Arg = F->arg_begin(); Arg != F->arg_end(); ++Arg) 
+            {
+                Value *ArgVal = dyn_cast<Value>(Arg);
+                if (ArgVal->getType()->isPointerTy())
+                {
+                    dbg(errs() << "PtrArg: "<< *ArgVal << "\n";)
+                    FnArgType[ArgVal] = MAX_TYPE;
+                }
+
+            }
+            return;
+        }
+
+        void trackPtrs(Function* F) 
         {
 
             // first check the byval arguments as they will be cleaned
@@ -1268,6 +1452,8 @@ namespace {
                         Function* CalleeF = CI->getCalledFunction();
                         if (!CalleeF) continue;
 
+                        std::string CalleeFName = demangleName(CalleeF->getName());
+
                         /* Volatile Ptrs */
                         if (isAllocLikeFn(CI, getTLI(*CalleeF)) ||
                             isReallocLikeFn(CI, getTLI(*CalleeF)) ||
@@ -1323,8 +1509,10 @@ namespace {
                             }
                         }                  
                         /* PM Ptrs */
-                        else if (CalleeF->getName().contains("pmemobj_direct")) //||
-                                //  CalleeF->getName().contains("spp_new_get"))
+                        else if ( CalleeF->getName().contains("pmemobj_direct") ||
+                                (StringRef(CalleeFName).startswith("pmem::obj::persistent_ptr") && 
+                                 StringRef(CalleeFName).contains("spp_get()")) )
+                                //  CalleeF->getName().contains("spp_get"))
                                 //  CalleeF->getName().contains("pmemobj_oid")) 
                         {
                             pmemPtrs.insert(Ins);
@@ -1515,7 +1703,7 @@ namespace {
                     }
                 }
             }
-            return false;
+            return;
         }
         
     };
@@ -1559,7 +1747,9 @@ namespace {
             //         // }
             //     }
             // }
-            dbg(errs() << M << "\n";)
+
+            // errs() << M << "\n";
+            
             //Track global ptrs
             for (auto GV = M.global_begin(); GV!=M.global_end(); GV++) 
             {
@@ -1590,7 +1780,8 @@ namespace {
             
             //Visit the functions to identify volatile ptrs, pm and vtable ptrs
             for (auto F = M.begin(), Fend = M.end(); F != Fend; ++F) 
-            {                
+            {
+                // Spp.trackFnArgs(&*F);
                 if (F->isDeclaration()) 
                 {
                     dbg(errs() << "External.. skipping\n";)
@@ -1603,15 +1794,43 @@ namespace {
                 }
 
                 dbg(errs() << "Internal.. processing\n";)
-                changed = Spp.trackPtrs(&*F);
+                Spp.trackPtrs(&*F);
 
                 // errs() << F->getName() << " ret : " << *F->getReturnType() << "\n";
             }
+
+            /*
+            for (auto F = M.begin(), Fend = M.end(); F != Fend; ++F) 
+            {
+                if (F->isDeclaration()) 
+                {
+                    dbg(errs() << "External.. skipping\n";)
+                    continue; 
+                }
+                if (isSPPFuncName(F->getName()))
+                {
+                    dbg(errs() << "SPP hook func.. skipping\n";)
+                    continue; 
+                }
+
+                Spp.propagateFnArgsTypes(&*F);
+            }
+            Spp.assessPtrArgs(&M);
+            */
+
             //Visit the functions to clear the appropriate ptr before external calls
             for (auto F = M.begin(), Fend = M.end(); F != Fend; ++F) 
             {
-                dbg(errs() << ">>Func : " << F->getName() << "\t";)
-                
+                std::string FName = Spp.demangleName(F->getName());
+                dbg(errs() << ">>Func : " << F->getName() << "\n";)
+                dbg(errs() << ">>Func Name demangled : " << FName << "\n";)
+                if (StringRef(FName).startswith("pmem::obj::persistent_ptr") &&
+                    StringRef(FName).contains("spp_get()"))
+                {
+                    // errs() << ">>Func : " << F->getName() << "\n";
+                    dbg(errs() << ">>Func Name demangled : " << FName << "\n";)
+                }
+
                 if (F->isDeclaration()) 
                 {
                     dbg(errs() << "External.. skipping\n";)
@@ -1651,6 +1870,7 @@ namespace {
             //         // }
             //     }
             // }
+            
             dbg(errs() << M << "\n";)
             
             Spp.memCleanUp();

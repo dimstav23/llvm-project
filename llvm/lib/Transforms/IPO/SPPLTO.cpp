@@ -81,8 +81,9 @@ struct SPPLTO : public ModulePass {
         VOL,
         PM,
         CONST,
-        UKNOWN
-    };
+        UKNOWN,
+        MAX_TYPE
+  };
 
   SPPLTO() : ModulePass(ID) 
   {
@@ -93,9 +94,15 @@ struct SPPLTO : public ModulePass {
   virtual bool redundantTagUpdates(Function *F);
   virtual bool duplicateCleanTags(Function *F);
   virtual bool duplicateCheckBounds(Function *F);
+
   virtual bool trackPtrs (Function * F);
+  virtual void trackFnArgs(Function* F);
+  virtual void propagateFnArgsTypes(Function* F);
+  virtual void assessPtrArgs(Module* M);
+
   virtual bool runOnFunction (Function * F, Module &M);
   virtual bool runOnModule(Module &M) override;
+
   bool doCallBase (CallBase * ins);
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
@@ -125,10 +132,11 @@ struct SPPLTO : public ModulePass {
 static std::unordered_set <Value*> globalPtrs;
 static std::unordered_set <Value*> untaggedPtrs;
 static std::unordered_set <Value*> pmemPtrs;
-static std::unordered_set <Value*> extPtrs;
 static std::unordered_set <Value*> vtPtrs;
 
 static std::vector<Instruction*> redundantChecks;
+DenseMap<Value*, SPPLTO::operandType> FnArgType;
+DenseMap<Value*, Function*> FnArgFun;
 
 char SPPLTO::ID = 0;
 
@@ -216,11 +224,9 @@ static void memCleanUp()
     untaggedPtrs.clear();
     globalPtrs.clear();
     pmemPtrs.clear();
-    // for (auto extPtr : extPtrs) {
-    //     errs()<< "ext Ptr:" << *extPtr << "\n"; 
-    // }
-    extPtrs.clear();
     vtPtrs.clear();
+    FnArgType.clear();
+    FnArgFun.clear();
 }
 
 static bool
@@ -280,12 +286,15 @@ doCallExternal(CallBase *CB)
     }
 
     if (CB->getCalledFunction() != NULL &&
-        !CB->getCalledFunction()->getName().contains("pmemobj_direct"))
+        !CB->getCalledFunction()->getName().contains("pmemobj_direct") &&
+        !(StringRef(CB->getCalledFunction()->getName()).startswith("pmem::obj::persistent_ptr") && 
+          StringRef(CB->getCalledFunction()->getName()).contains("spp_get()")) &&
+        !CB->getCalledFunction()->getName().equals("__spp_updatetag_direct"))
     {
         Value *CBval = dyn_cast<Value>(CB);
         if (CBval)
         {
-            extPtrs.insert(CBval);
+            untaggedPtrs.insert(CBval);
             std::vector<User*> Users(CBval->user_begin(), CBval->user_end());
             dbg(errs() << ">>external callback : " << *CBval << " Uses: " \
                                             << CBval->getNumUses() << "\n";)
@@ -300,7 +309,7 @@ doCallExternal(CallBase *CB)
                     case Instruction::PtrToInt:
                     case Instruction::IntToPtr:
                     case Instruction::GetElementPtr:
-                        extPtrs.insert(iUser);
+                        untaggedPtrs.insert(iUser);
                     default:
                         break;
                 }                      
@@ -339,10 +348,9 @@ doCallExternal(CallBase *CB)
 
         if ( untaggedPtrs.find(ArgVal->stripPointerCasts()) != untaggedPtrs.end() ||
              vtPtrs.find(ArgVal->stripPointerCasts()) != vtPtrs.end() ||
-             globalPtrs.find(ArgVal->stripPointerCasts()) != globalPtrs.end() ||
-             extPtrs.find(ArgVal->stripPointerCasts()) != extPtrs.end() )
+             globalPtrs.find(ArgVal->stripPointerCasts()) != globalPtrs.end() )
         {
-            dbg(errs() << ">>global, volatile or external ptr skipped cleaning: " << *CB << "\n";)
+            dbg(errs() << ">>global or volatile ptr skipped cleaning: " << *CB << "\n";)
             continue;
         }
         
@@ -362,6 +370,7 @@ doCallExternal(CallBase *CB)
         Value *Unmasked = B.CreateBitCast(Masked, ArgVal->getType()); 
 
         CB->setArgOperand(Arg - CB->arg_begin(), Unmasked);
+        untaggedPtrs.insert(Unmasked);
 
         dbg(errs() << ">>new_CB after masking: " << *CB << "\n";)
         dbg(errs() << "inserted : " << *Masked << " in " << CB->getFunction()->getName() << "\n";)
@@ -456,6 +465,190 @@ SPPLTO::doCallBase(CallBase *cb)
     return changed;
 }
 
+
+void 
+SPPLTO::assessPtrArgs(Module* M)
+{
+    // initially add the args to their respective categories
+    for (auto it : FnArgType)
+    {
+        Value* ArgVal= it.first;
+        operandType Type = it.second;
+        if (ArgVal && Type == PM)
+        {
+            dbg(errs() << "PM argument found " << *ArgVal << "\n";)
+            pmemPtrs.insert(ArgVal);
+            setSPPprefix(ArgVal);
+
+        }
+        else if (ArgVal && Type == VOL)
+        {
+            dbg(errs() << "VOL argument found " << *ArgVal << "\n";)
+            untaggedPtrs.insert(ArgVal);
+            std::vector<User*> Users(ArgVal->user_begin(), ArgVal->user_end());
+            for (auto User : Users) 
+            {
+                Instruction *iUser= dyn_cast<Instruction>(User);
+                // mark directly derived values as volatile:
+                switch (iUser->getOpcode()) 
+                {
+                    case Instruction::BitCast:
+                    case Instruction::PtrToInt:
+                    case Instruction::IntToPtr:
+                    case Instruction::GetElementPtr:
+                        dbg(errs() << ">>VOL argument ptr use: " << *iUser << "\n";)
+                        untaggedPtrs.insert(iUser);
+                    default:
+                        break;
+                }                      
+            }
+        }
+        else if (ArgVal && Type == MAX_TYPE)
+        {
+            dbg(errs() << ">>" << FnArgFun[ArgVal]->getName() << " : Didn't find a call with " << *ArgVal << "\n";)
+        }
+    }
+
+    //go through the code again to completely propagate through subsequent bitcasts and GEPs
+    for (auto F = M->begin(), Fend = M->end(); F != Fend; ++F) 
+    {
+        for (auto BB= F->begin(); BB!= F->end(); ++BB)
+        {
+            for (auto II = BB->begin(); II != BB->end(); ++II) 
+            {
+                Instruction* Ins= &*II;
+                if (auto *Gep = dyn_cast<GetElementPtrInst>(Ins)) 
+                {
+                    Value *Operand = Gep->getPointerOperand()->stripPointerCasts();
+                    if (pmemPtrs.find(Operand) != pmemPtrs.end())
+                    {
+                        dbg(errs() << "new pm ptr\n";)
+                        pmemPtrs.insert(Gep);
+                        setSPPprefix(Gep);
+                    }
+                    else if (untaggedPtrs.find(Operand) != untaggedPtrs.end() ||
+                            globalPtrs.find(Operand) != globalPtrs.end() ||
+                            vtPtrs.find(Operand) != vtPtrs.end())
+                    {
+                        dbg(errs() << "new vol ptr\n";)
+                        untaggedPtrs.insert(Gep);
+                    }
+                }
+                else if (auto *Bitcast = dyn_cast<BitCastInst>(Ins)) 
+                {
+                    Value *Operand = Bitcast->getOperand(0)->stripPointerCasts();
+                    if (pmemPtrs.find(Operand) != pmemPtrs.end())
+                    {
+                        dbg(errs() << "new pm ptr\n";)
+                        pmemPtrs.insert(Bitcast);
+                        setSPPprefix(Bitcast);
+                    }
+                    else if (untaggedPtrs.find(Operand) != untaggedPtrs.end() ||
+                            globalPtrs.find(Operand) != globalPtrs.end() ||
+                            vtPtrs.find(Operand) != vtPtrs.end())
+                    {
+                        dbg(errs() << "new vol ptr " << *Bitcast << "\n";)
+                        untaggedPtrs.insert(Bitcast);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void 
+SPPLTO::propagateFnArgsTypes(Function* F) 
+{
+    for (auto BI= F->begin(); BI!= F->end(); ++BI) 
+    {
+        BasicBlock *BB = &*BI; 
+
+        for (auto II = BB->begin(); II != BB->end(); ++II) 
+        {
+            Instruction* Ins= &*II;
+            // CallBase to include CallInst and InvokeInst
+            if (auto *CI = dyn_cast<CallBase>(Ins))
+            {   
+                dbg(errs() << "call :" << *CI << "\n";)
+                for (auto Arg = CI->arg_begin(); Arg != CI->arg_end(); ++Arg) 
+                {
+                    Value *ArgVal = dyn_cast<Value>(Arg);
+                    if (ArgVal->getType()->isPointerTy())
+                    {
+                        unsigned argIdx = CI->getArgOperandNo(Arg);
+                        dbg(errs() << "PtrArg: " << *ArgVal->stripPointerCasts() << " in position " << argIdx <<"\n";)
+                        Function* CalleeF = CI->getCalledFunction();
+
+                        if (!CalleeF) 
+                        {
+                            continue;
+                        }   
+                        if (CalleeF->isDeclaration())
+                        {
+                            dbg(errs() << "skipped decl " << CalleeF->getName() << " from " << *CI << "\n";)
+                            continue; // external funcs, cleaned anyway
+                        }
+                        if (CalleeF->arg_size() <= argIdx) 
+                        {
+                            dbg(errs() << "skipped arg " << CalleeF->getName() << " from " << *CI << "\n";)
+                            continue; // functions with arbitrary args cannot be tracked
+                        }
+
+                        if (pmemPtrs.find(ArgVal->stripPointerCasts()) != pmemPtrs.end())
+                        {
+                            Value* FnArg = CalleeF->getArg(argIdx);
+                            if (FnArgType[FnArg] == MAX_TYPE)
+                                FnArgType[FnArg] = PM;
+                            else if (FnArgType[FnArg] != PM)
+                                FnArgType[FnArg] = UKNOWN;
+                        }
+                        else if (untaggedPtrs.find(ArgVal->stripPointerCasts()) != untaggedPtrs.end() ||
+                                    globalPtrs.find(ArgVal->stripPointerCasts()) != globalPtrs.end() ||
+                                    vtPtrs.find(ArgVal->stripPointerCasts()) != vtPtrs.end())
+                        {
+                            Value* FnArg = CalleeF->getArg(argIdx);
+                            if (FnArgType[FnArg] == MAX_TYPE)
+                                FnArgType[FnArg] = VOL;
+                            else if (FnArgType[FnArg] != VOL)
+                                FnArgType[FnArg] = UKNOWN;
+                        }
+                        else 
+                        {
+                            Value* FnArg = CalleeF->getArg(argIdx);
+                            FnArgType[FnArg] = UKNOWN;
+                        }
+                        
+                        dbg(Value* FnArg = CalleeF->getArg(argIdx);)
+                        dbg(errs() << "FnArg: " << *FnArg << " type : " << FnArgType[FnArg] << "\n";)
+                        dbg(errs() << "Function :" << CalleeF->getName() << "\n";)
+                        dbg(errs() << "respective arg: " << *CalleeF->getArg(argIdx) << "\n";)
+                    }
+                }
+            }
+        }
+    }
+    return;
+}
+
+void 
+SPPLTO::trackFnArgs(Function* F) 
+{
+    dbg(errs() << "Function: " << demangleName(F->getName()) << " with " << F->arg_size() << " argument(s): \n";)
+    dbg(errs() << "real fname: " << F->getName() << "\n";)
+    for (auto Arg = F->arg_begin(); Arg != F->arg_end(); ++Arg) 
+    {
+        Value *ArgVal = dyn_cast<Value>(Arg);
+        if (ArgVal->getType()->isPointerTy())
+        {
+            dbg(errs() << "PtrArg: "<< *ArgVal << "\n";)
+            FnArgType[ArgVal] = MAX_TYPE;
+            FnArgFun[ArgVal] = F;
+        }
+
+    }
+    return;
+}
+
 bool 
 SPPLTO::trackPtrs(Function* F) 
 {
@@ -527,6 +720,8 @@ SPPLTO::trackPtrs(Function* F)
             { 
                 Function* CalleeF = CI->getCalledFunction();
                 if (!CalleeF) continue;
+
+                std::string CalleeFName = demangleName(CalleeF->getName());
 
                 //- Volatile Ptr -// 
                 if (isAllocLikeFn(CI, getTLI(*CalleeF)) ||
@@ -620,8 +815,11 @@ SPPLTO::trackPtrs(Function* F)
                     }
                 }                
                 //- PM ptr -//
-                else if (CalleeF->getName().contains("pmemobj_direct"))// ||
-                        //  CalleeF->getName().contains("spp_new_get")) 
+                else if ( CalleeF->getName().contains("pmemobj_direct") ||
+                        (StringRef(CalleeFName).startswith("pmem::obj::persistent_ptr") && 
+                         StringRef(CalleeFName).contains("spp_get()")) ||
+                         CalleeF->getName().equals("__spp_updatetag_direct"))
+                        //  CalleeF->getName().contains("pmemobj_oid")) 
                 {
                     pmemPtrs.insert(Ins);
                     setSPPprefix(Ins);
@@ -1001,7 +1199,8 @@ SPPLTO::redundantCB(Function *FN)
                 {
                     if (cfn->getName().contains("__spp_checkbound") ||
                         cfn->getName().contains("__spp_updatetag") || 
-                        cfn->getName().contains("__spp_cleantag"))
+                        cfn->getName().contains("__spp_cleantag") ||
+                        cfn->getName().contains("__spp_memintr_check_and_clean"))
                     {
                         dbg(errs() << ">>CallBase: "<<*cb<<"\n";)
     
@@ -1029,10 +1228,10 @@ SPPLTO::redundantCB(Function *FN)
                             }
 
                             // stripPointerCasts() is needed to identify untracked bitcasts
-                            if ( extPtrs.find(ArgVal->stripPointerCasts()) != extPtrs.end() ||
-                                 globalPtrs.find(ArgVal->stripPointerCasts()) != globalPtrs.end() ||
+                            if ( globalPtrs.find(ArgVal->stripPointerCasts()) != globalPtrs.end() ||
                                  untaggedPtrs.find(ArgVal->stripPointerCasts()) != untaggedPtrs.end() ||
-                                 vtPtrs.find(ArgVal->stripPointerCasts()) != vtPtrs.end() )
+                                 vtPtrs.find(ArgVal->stripPointerCasts()) != vtPtrs.end() ||
+                                 isa<Constant>(ArgVal) )
                             {   
                                 //replace uses of the returned value with ArgVal
                                 //and remove the function call
@@ -1044,19 +1243,26 @@ SPPLTO::redundantCB(Function *FN)
                                 for (auto User : Users) 
                                 {
                                     Instruction *iUser= dyn_cast<Instruction>(User);
-                                    dbg(errs() << ">>New external ptr use: " << *iUser << "\n";)
-
-                                    // mark new directly derived values as external:
-                                    switch (iUser->getOpcode()) 
+                                    if (iUser)
                                     {
-                                        case Instruction::BitCast:
-                                        case Instruction::PtrToInt:
-                                        case Instruction::IntToPtr:
-                                        case Instruction::GetElementPtr:
-                                            untaggedPtrs.insert(iUser);
-                                        default:
-                                            break;
-                                    }                      
+                                        dbg(errs() << ">>New external ptr use: " << *iUser << "\n";)
+
+                                        // mark new directly derived values as external:
+                                        switch (iUser->getOpcode()) 
+                                        {
+                                            case Instruction::BitCast:
+                                            case Instruction::PtrToInt:
+                                            case Instruction::IntToPtr:
+                                            case Instruction::GetElementPtr:
+                                                untaggedPtrs.insert(iUser);
+                                            default:
+                                                break;
+                                        }
+                                    }
+                                    else
+                                    {
+                                        dbg(errs() << "not an ins ptr use:" << *User << "\n";)
+                                    }                
                                 }
                                 dbg(errs() << "added " << *cb << " from " << FN->getName() << "\n";)
                                 redundantChecks.push_back(cb);
@@ -1078,6 +1284,8 @@ SPPLTO::redundantCB(Function *FN)
                                         FnName = "__spp_cleantag_direct";
                                     else if (cfn->getName().equals("__spp_cleantag_external"))
                                         FnName = "__spp_cleantag_external_direct";
+                                    else if (cfn->getName().equals("__spp_memintr_check_and_clean"))
+                                        FnName = "__spp_memintr_check_and_clean_direct";
                                     
                                     FunctionType *fty = cfn->getFunctionType();
                                     FunctionCallee hook = mod->getOrInsertFunction(FnName, fty); 
@@ -1130,8 +1338,7 @@ SPPLTO::redundantCB(Function *FN)
                             }
 
                             // stripPointerCasts() is needed to identify untracked bitcasts
-                            if ( extPtrs.find(ArgVal->stripPointerCasts()) != extPtrs.end() ||
-                                 globalPtrs.find(ArgVal->stripPointerCasts()) != globalPtrs.end() ||
+                            if ( globalPtrs.find(ArgVal->stripPointerCasts()) != globalPtrs.end() ||
                                  untaggedPtrs.find(ArgVal->stripPointerCasts()) != untaggedPtrs.end() ||
                                  vtPtrs.find(ArgVal->stripPointerCasts()) != vtPtrs.end() )
                             {   
@@ -1253,15 +1460,40 @@ SPPLTO::runOnModule(Module &M)
     }
 
     // errs() << M << "\n";
-    
+
+    //initial ptr tracking based on PTR derivation functions
     for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
     {
+        trackFnArgs(&*Fn);
         trackPtrs(&*Fn);
     }
+
+    //function arguments PTR type tracking
+    for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+    {
+        if (Fn->isDeclaration()) 
+        {
+            dbg(errs() << ">>declaration: skipping..\n";)
+            continue;
+        }
+        propagateFnArgsTypes(&*Fn);
+    }
+    assessPtrArgs(&M);
+
 
     for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
     {
         dbg(errs() << ">>FName: " << Fn->getName() << "\n";)
+
+        std::string FName = demangleName(Fn->getName());
+        dbg(errs() << ">>Func : " << Fn->getName() << "\n";)
+        dbg(errs() << ">>Func Name demangled : " << FName << "\n";)
+        if (StringRef(FName).startswith("pmem::obj::persistent_ptr") &&
+            StringRef(FName).contains("spp_get()"))
+        {
+            dbg(errs() << ">>Func Name demangled : " << FName << "\n";)
+        }
+
         // errs() << *Fn << "\n";
         if (Fn->isDeclaration()) 
         {
@@ -1331,7 +1563,7 @@ SPPLTO::runOnModule(Module &M)
     //     }
     // }
 
-    // errs() << M << "\n";
+    dbg(errs() << M << "\n";)
     
     memCleanUp();
 
