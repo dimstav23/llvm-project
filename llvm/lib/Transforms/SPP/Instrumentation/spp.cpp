@@ -104,10 +104,7 @@ namespace {
         std::unordered_set <Value*> cxaPtrs;
         std::unordered_set <Value*> checkedPtrs;
 
-        std::vector<Instruction*> GEP_hooked_CBs;
-        std::vector<Instruction*> GEP_skipped_CBs;
-
-        DenseMap<Value*, operandType> FnArgType;
+        std::unordered_set <Instruction*> safeGEPs;
     
         SPPPass(Module* M) 
         {
@@ -142,7 +139,7 @@ namespace {
             this->vtPtrs.clear();
             this->cxaPtrs.clear();
             this->checkedPtrs.clear();
-            this->FnArgType.clear();
+            this->safeGEPs.clear();
         }
 
         std::string demangleName(StringRef str)
@@ -299,6 +296,11 @@ namespace {
         bool isMissedGep(GetElementPtrInst *gep, Instruction *userI)
         {
             if (isVtableGep(gep))
+            {
+                return false;
+            }
+
+            if (safeGEPs.find(gep) != safeGEPs.end())
             {
                 return false;
             }
@@ -785,6 +787,12 @@ namespace {
                 dbg(errs() << ">>GEP: Constant.. skipping...\n";)
                 return false;
             }
+
+            if (safeGEPs.find(Gep) != safeGEPs.end())
+            {
+                dbg(errs() << ">>GEP: skipped because marked as safe due to preemption\n";)
+                return false;
+            }
                     
             /* We want to skip GEPs on vtable stuff, as they shouldn't be able to
             * overflow, and because they don't have metadata normally negative
@@ -1159,6 +1167,249 @@ namespace {
             return true;
         }
         
+        int getMemPointerOperandIdx(Instruction* I) {
+		    switch (I->getOpcode()) {
+            case Instruction::Load:
+                return cast<LoadInst>(I)->getPointerOperandIndex();
+            case Instruction::Store:
+                return cast<StoreInst>(I)->getPointerOperandIndex();
+            case Instruction::AtomicCmpXchg:
+                return cast<AtomicCmpXchgInst>(I)->getPointerOperandIndex();
+            case Instruction::AtomicRMW:
+                return cast<AtomicRMWInst>(I)->getPointerOperandIndex();
+            }
+            return -1;
+        }
+
+        void analyzeScalarEvolutionInLoop(Instruction* I) {
+            const SCEV* ptrSCEV = SE->getSCEV(I->getOperand(getMemPointerOperandIdx(I)));
+            const SCEVAddRecExpr *AR = cast<SCEVAddRecExpr>(ptrSCEV);
+
+            // we only work with expressions of form `A + B*x`
+            if (!AR->isAffine())  return;
+            // we only work with loops that have preheader (to put our optimized checks there)
+            if (!AR->getLoop()->getLoopPreheader())  return;
+            // we only work with memops that are guarantees to execute on each iteration
+            if (!isGuaranteedToExecuteForEveryIteration(I, AR->getLoop()))  return;
+
+            dbg(errs() << "entered " << __func__ << " with " << *I <<"\n";)
+            
+            // insert dummy load from base-ptr in loop header: this will force
+            // the following instrumentation to insert corresponding bounds check;
+            // the load instruction itself will be optimized away later,
+            // moreover, the lower-bound load will also be optimized away if unneeded
+            // BasicBlock* preheader = AR->getLoop()->getLoopPreheader();
+            // IRBuilder<> IRB(preheader->getTerminator());
+            // const DataLayout &DL = preheader->getModule()->getDataLayout();
+            // SCEVExpander Expander(*SE, DL, "loopscevs");
+
+            // // insert code for start check
+            // Value* expanded = Expander.expandCodeFor(AR->getStart(), nullptr, preheader->getTerminator());
+            // Instruction* startI = IRB.CreateLoad(expanded, "dummyoptimizationloadstart");
+
+            // // insert code for exit check if possible (works for simple loops with one exit)
+            // Instruction* exitI = nullptr;
+            // const SCEV *ExitValue = SE->getSCEVAtScope(AR, AR->getLoop()->getParentLoop());
+            // if (SE->isLoopInvariant(ExitValue, AR->getLoop())) {
+            //     expanded = Expander.expandCodeFor(ExitValue, nullptr, preheader->getTerminator());
+            //     exitI = IRB.CreateLoad(expanded, "dummyoptimizationloadexit");
+            //     // exit check's existence implies no checks are needed inside loop
+            //     markNoLowerBoundCheck(I);
+            //     markNoUpperBoundCheck(I);
+            // }
+            // // memorize pair "this meminst -> headerload", the following instrumentation
+            // // will recognize such meminsts and use headerload's extracted lo/up bounds
+            // assert(optimizedMemInsts.count(I) == 0 && "SE-Loop optimization analyzed instruction more than once?!");
+            // optimizedMemInsts[I] = startI;
+
+            // if (SE->isKnownPositive(AR->getStepRecurrence(*SE))) {
+            //     markNoLowerBoundCheck(I);
+            //     markNoUpperBoundCheck(startI);
+            //     if (exitI)  markNoLowerBoundCheck(exitI);
+            // }
+            // if (SE->isKnownNegative(AR->getStepRecurrence(*SE))) {
+            //     markNoUpperBoundCheck(I);
+            //     markNoLowerBoundCheck(startI);
+            //     if (exitI)  markNoUpperBoundCheck(exitI);
+            // }
+        }
+
+        bool SCEVtest(Function* F) 
+        {
+            for (auto BI = F->begin(); BI != F->end(); ++BI) 
+            {
+                BasicBlock *BB = &*BI; 
+                Instruction *sucInst = &*(BB->begin());
+
+                for (auto II = BB->begin(); II != BB->end(); ++II) 
+                {    
+                    Instruction *Ins= &*II;
+                    if (isa<LoadInst>(Ins) || isa<StoreInst>(Ins) || isa<AtomicRMWInst>(Ins) || isa<AtomicCmpXchgInst>(Ins)) 
+                    {
+                        Value* ptr = Ins->getOperand(getMemPointerOperandIdx(Ins));
+					    unsigned size = ptr->getType()->getPointerElementType()->getPrimitiveSizeInBits() / 8;
+                        if (static_cast<SCEVTypes>(SE->getSCEV(ptr)->getSCEVType()) == scAddRecExpr) {
+                            dbg(errs() << "entered " << __func__ << " with " << F->getName() <<"\n";)
+                            analyzeScalarEvolutionInLoop(Ins);
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+
+        static bool isOnlyUsedAndDereferencedInBlock(Instruction *I, BasicBlock *BB) {
+            for (User *U : I->users()) {
+                if (cast<Instruction>(U)->getParent() != BB) {
+                    return false;
+                }
+                else if (auto *SI = dyn_cast<StoreInst>(U)) {
+                    if (SI->getValueOperand() == I)
+                        return false;
+                }
+                else if (!isa<LoadInst>(U)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        static unsigned firstDeref(const Instruction *Ptr) {
+            int Idx = 0;
+            for (const Instruction &I : *Ptr->getParent()) {
+                if (isa<LoadInst>(&I)) {
+                    return Idx;
+                }
+                else if (auto *SI = dyn_cast<StoreInst>(&I)) {
+                    if (SI->getPointerOperand() == Ptr)
+                        return Idx;
+                }
+                Idx++;
+            }
+            dbg(errs() << "gep is never dereferenced (func " << Ptr->getParent()->getParent()->getName() << "):\n";)
+            Ptr->dump();
+            assert(false);
+            return 0;
+        }
+
+        bool preemptBoundsCheck(BasicBlock* BB) {
+            bool changed = false;
+            DenseMap<Value*, SmallVector<GetElementPtrInst*, 4>> InternalGEPs;
+
+            for (auto II = BB->begin(); II != BB->end(); ++II) {
+                Instruction *I= &*II;
+                if (auto *Gep = dyn_cast<GetElementPtrInst>(I)) 
+                {      
+
+                    if (globalPtrs.find(Gep->getPointerOperand()->stripPointerCasts()) != globalPtrs.end())
+                    {
+                        dbg(errs() << __func__ << ">>global ptr skipped GEP preemption: " << *Gep << "\n";)
+                        continue;
+                    }            
+
+                    if (untaggedPtrs.find(Gep->getPointerOperand()->stripPointerCasts()) != untaggedPtrs.end())
+                    {
+                        dbg(errs() << __func__<< ">>volatile ptr skipped GEP preemption: " << *Gep << "\n";)
+                        continue;
+                    }   
+
+                    if (vtPtrs.find(Gep->getPointerOperand()->stripPointerCasts()) != vtPtrs.end())
+                    {
+                        dbg(errs() << __func__<< ">>vtable ptr skipped GEP preemption: " << *Gep << "\n";)
+                        continue;
+                    }                
+                    if (Gep->hasAllConstantIndices())
+                    {
+                        if (isOnlyUsedAndDereferencedInBlock(Gep, BB))
+                        {
+                            InternalGEPs.FindAndConstruct(Gep->getPointerOperand()).second.push_back(Gep);
+                        }
+                    }
+                }
+            }
+
+            IRBuilder<> B(BB->getContext());
+
+            for (auto P : InternalGEPs) {
+                Value *Base = P.first; // the ptr GEPs refer to
+                SmallVector<GetElementPtrInst*, 4> &GEPs = P.second;
+
+                // Only consider each base pointer that have multiple uses in the block
+                if (GEPs.size() < 2)
+                    continue;
+                else
+                    dbg(errs() << "there is a chance for preemption in:\n" << BB->getParent()->getName() << *BB << "\n";)
+                
+                // Set the insert point before sorting to make sure the masked base
+                // will dominate all uses 
+                // GEPs[0] is the first one found and pushed in the vector
+                B.SetInsertPoint(GEPs[0]);
+                
+                // Sort the GEPs in the order in which they are dereferenced
+                std::sort(GEPs.begin(), GEPs.end(),
+                        [](const GetElementPtrInst *A, const GetElementPtrInst *B) {
+                            return firstDeref(A) < firstDeref(B);
+                        });
+
+                // Find the maximum offset
+                unsigned PointerBits=64;
+                GetElementPtrInst *MaxOffsetGEP = GEPs[0]; // GEP command
+                APInt MaxOffset(PointerBits, 0); // init max off to 0
+                GEPs[0]->accumulateConstantOffset(*DL, MaxOffset);
+
+                for (unsigned i = 1, n = GEPs.size(); i < n; ++i) {
+                    APInt Offset(PointerBits, 0);
+                    GEPs[i]->accumulateConstantOffset(*DL, Offset);
+                    if (Offset.sgt(MaxOffset)) {
+                        MaxOffset = Offset;
+                        MaxOffsetGEP = GEPs[i];
+                    }
+                }
+                dbg(errs() << "MaxOffset : " << MaxOffset << " in " << *MaxOffsetGEP << "\n";)
+                
+                // update the tag once and propagate the output to the spotted GEPs
+                // create hook prototype
+                Type *RetArgTy = Type::getInt8PtrTy(M->getContext());
+                Type *Arg2Ty = Type::getInt64Ty(M->getContext());
+                SmallVector <Type*, 2> tlist;
+                tlist.push_back(RetArgTy);
+                tlist.push_back(Arg2Ty);
+                
+                FunctionType *hookfty = FunctionType::get(RetArgTy, tlist, false);
+                FunctionCallee hook;           
+                if (pmemPtrs.find(MaxOffsetGEP->getPointerOperand()->stripPointerCasts()) != pmemPtrs.end())
+                {
+                    dbg(errs() << "__spp_updatetag_direct\n";)
+                    hook = M->getOrInsertFunction("__spp_updatetag_direct", hookfty);
+                }
+                else 
+                {
+                    hook = M->getOrInsertFunction("__spp_updatetag", hookfty);
+                }
+
+                Value *TmpPtr = B.CreateBitCast(MaxOffsetGEP->getPointerOperand(), hook.getFunctionType()->getParamType(0));
+                Value *IntOff = ConstantInt::get(hook.getFunctionType()->getParamType(1), MaxOffset);
+                //Value *IntOff = B.CreateSExt(MaxOffset, hook.getFunctionType()->getParamType(1));
+                
+                std::vector<Value*> args;
+                args.push_back(TmpPtr);
+                args.push_back(IntOff);
+
+                CallInst *Masked = B.CreateCall(hook, args);
+                Masked->setDoesNotThrow(); //to avoid it getting converted to invoke     
+                Value *UpdatedPtr = B.CreatePointerCast(Masked, MaxOffsetGEP->getPointerOperand()->getType());  
+
+                for (unsigned i = 0, n = GEPs.size(); i < n; ++i) {
+                    GEPs[i]->setOperand(0, UpdatedPtr);
+                    safeGEPs.insert(GEPs[i]);
+                }
+                dbg(errs() << "New BB:\n" << *BB << "\n";)
+            }
+            
+
+            return changed;
+        }
+
         bool visitFunc(Function* F) 
         {
             bool changed = false;
@@ -1167,6 +1418,8 @@ namespace {
             {
                 BasicBlock *BB = &*BI; 
                 Instruction *sucInst = &*(BB->begin());
+
+                preemptBoundsCheck(BB);
 
                 for (auto II = BB->begin(); II != BB->end(); ++II) 
                 {    
@@ -1216,167 +1469,9 @@ namespace {
                         changed = instrCallBase(&*callBase);
                     }
                 }
-            } //endof forloop
+            } //endof forloop            
 
             return changed;
-        }
-
-        void assessPtrArgs(Module* M)
-        {
-            // initially add the args to their respective categories
-            for (auto it : FnArgType)
-            {
-                Value* ArgVal= it.first;
-                operandType Type = it.second;
-
-                if (Type == PM)
-                {
-                    dbg(errs() << "PM argument found " << *ArgVal << "\n";)
-                    pmemPtrs.insert(ArgVal);
-                    setSPPprefix(ArgVal);
-
-                }
-                else if (Type == VOL)
-                {
-                    dbg(errs() << "VOL argument found " << *ArgVal << "\n";)
-                    untaggedPtrs.insert(ArgVal);
-                    std::vector<User*> Users(ArgVal->user_begin(), ArgVal->user_end());
-                    for (auto User : Users) 
-                    {
-                        Instruction *iUser= dyn_cast<Instruction>(User);
-                        // mark directly derived values as volatile:
-                        switch (iUser->getOpcode()) 
-                        {
-                            case Instruction::BitCast:
-                            case Instruction::PtrToInt:
-                            case Instruction::IntToPtr:
-                            case Instruction::GetElementPtr:
-                                dbg(errs() << ">>VOL argument ptr use: " << *iUser << "\n";)
-                                untaggedPtrs.insert(iUser);
-                            default:
-                                break;
-                        }                      
-                    }
-                }
-            }
-
-            //go through the code again to completely propagate through subsequent bitcasts and GEPs
-            for (auto F = M->begin(), Fend = M->end(); F != Fend; ++F) 
-            {
-                for (auto BB= F->begin(); BB!= F->end(); ++BB)
-                {
-                    for (auto II = BB->begin(); II != BB->end(); ++II) 
-                    {
-                        Instruction* Ins= &*II;
-                        if (auto *Gep = dyn_cast<GetElementPtrInst>(Ins)) 
-                        {
-                            Value *Operand = Gep->getPointerOperand()->stripPointerCasts();
-                            if (pmemPtrs.find(Operand) != pmemPtrs.end())
-                            {
-                                dbg(errs() << "new pm ptr\n";)
-                                pmemPtrs.insert(Gep);
-                                setSPPprefix(Gep);
-                            }
-                            else if (untaggedPtrs.find(Operand) != untaggedPtrs.end() ||
-                                    globalPtrs.find(Operand) != globalPtrs.end() ||
-                                    vtPtrs.find(Operand) != vtPtrs.end())
-                            {
-                                dbg(errs() << "new vol ptr\n";)
-                                untaggedPtrs.insert(Gep);
-                            }
-                        }
-                        else if (auto *Bitcast = dyn_cast<BitCastInst>(Ins)) 
-                        {
-                            Value *Operand = Bitcast->getOperand(0)->stripPointerCasts();
-                            if (pmemPtrs.find(Operand) != pmemPtrs.end())
-                            {
-                                dbg(errs() << "new pm ptr\n";)
-                                pmemPtrs.insert(Bitcast);
-                                setSPPprefix(Bitcast);
-                            }
-                            else if (untaggedPtrs.find(Operand) != untaggedPtrs.end() ||
-                                    globalPtrs.find(Operand) != globalPtrs.end() ||
-                                    vtPtrs.find(Operand) != vtPtrs.end())
-                            {
-                                dbg(errs() << "new vol ptr\n";)
-                                untaggedPtrs.insert(Bitcast);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        void propagateFnArgsTypes(Function* F) 
-        {
-            for (auto BI= F->begin(); BI!= F->end(); ++BI) 
-            {
-                BasicBlock *BB = &*BI; 
-
-                for (auto II = BB->begin(); II != BB->end(); ++II) 
-                {
-                    Instruction* Ins= &*II;
-                    // CallBase to include CallInst and InvokeInst
-                    if (auto *CI = dyn_cast<CallBase>(Ins))
-                    {   
-                        dbg(errs() << "call :" << *CI << "\n";)
-                        for (auto Arg = CI->arg_begin(); Arg != CI->arg_end(); ++Arg) 
-                        {
-                            Value *ArgVal = dyn_cast<Value>(Arg);
-                            if (ArgVal->getType()->isPointerTy())
-                            {
-                                unsigned argIdx = CI->getArgOperandNo(Arg);
-                                dbg(errs() << "PtrArg: " << *ArgVal->stripPointerCasts() << " in position " << argIdx <<"\n";)
-                                Function* CalleeF = CI->getCalledFunction();
-
-                                if (!CalleeF || CalleeF->isDeclaration()) continue; // external funcs, cleaned anyway
-                                if (CalleeF->arg_size() <= argIdx) continue; // functions with arbitrary args cannot be tracked
-                                
-                                if (pmemPtrs.find(ArgVal->stripPointerCasts()) != pmemPtrs.end())
-                                {
-                                    Value* FnArg = CalleeF->getArg(argIdx);
-                                    if (FnArgType[FnArg] == MAX_TYPE)
-                                        FnArgType[FnArg] = PM;
-                                    else if (FnArgType[FnArg] != PM)
-                                        FnArgType[FnArg] = UKNOWN;
-                                }
-                                else if (untaggedPtrs.find(ArgVal->stripPointerCasts()) != untaggedPtrs.end() ||
-                                         globalPtrs.find(ArgVal->stripPointerCasts()) != globalPtrs.end() ||
-                                         vtPtrs.find(ArgVal->stripPointerCasts()) != vtPtrs.end())
-                                {
-                                    Value* FnArg = CalleeF->getArg(argIdx);
-                                    if (FnArgType[FnArg] == MAX_TYPE)
-                                        FnArgType[FnArg] = VOL;
-                                    else if (FnArgType[FnArg] != VOL)
-                                        FnArgType[FnArg] = UKNOWN;
-                                }
-                                dbg(Value* FnArg = CalleeF->getArg(argIdx);)
-                                dbg(errs() << "FnArg: " << *FnArg << " type : " << FnArgType[FnArg] << "\n";)
-                                dbg(errs() << "Function :" << CalleeF->getName() << "\n";)
-                                dbg(errs() << "respective arg: " << *CalleeF->getArg(argIdx) << "\n";)
-                            }
-                        }
-                    }
-                }
-            }
-            return;
-        }
-
-        void trackFnArgs(Function* F) 
-        {
-            dbg(errs() << "Function: " << demangleName(F->getName()) << " with " << F->arg_size() << " argument(s): \n";)
-            dbg(errs() << "real fname: " << F->getName() << "\n";)
-            for (auto Arg = F->arg_begin(); Arg != F->arg_end(); ++Arg) 
-            {
-                Value *ArgVal = dyn_cast<Value>(Arg);
-                if (ArgVal->getType()->isPointerTy())
-                {
-                    dbg(errs() << "PtrArg: "<< *ArgVal << "\n";)
-                    FnArgType[ArgVal] = MAX_TYPE;
-                }
-
-            }
-            return;
         }
 
         void trackPtrs(Function* F) 
@@ -1719,6 +1814,7 @@ namespace {
             // AU.addRequired<DominatorTreeWrapperPass>();
             // AU.addRequired<AAResultsWrapperPass>(); 
             // AU.addRequired<CallGraphWrapperPass>(); 
+            AU.addRequired<ScalarEvolutionWrapperPass>();
             AU.addRequired<TargetLibraryInfoWrapperPass>();
         }
 
@@ -1781,7 +1877,6 @@ namespace {
             //Visit the functions to identify volatile ptrs, pm and vtable ptrs
             for (auto F = M.begin(), Fend = M.end(); F != Fend; ++F) 
             {
-                // Spp.trackFnArgs(&*F);
                 if (F->isDeclaration()) 
                 {
                     dbg(errs() << "External.. skipping\n";)
@@ -1798,25 +1893,6 @@ namespace {
 
                 // errs() << F->getName() << " ret : " << *F->getReturnType() << "\n";
             }
-
-            /*
-            for (auto F = M.begin(), Fend = M.end(); F != Fend; ++F) 
-            {
-                if (F->isDeclaration()) 
-                {
-                    dbg(errs() << "External.. skipping\n";)
-                    continue; 
-                }
-                if (isSPPFuncName(F->getName()))
-                {
-                    dbg(errs() << "SPP hook func.. skipping\n";)
-                    continue; 
-                }
-
-                Spp.propagateFnArgsTypes(&*F);
-            }
-            Spp.assessPtrArgs(&M);
-            */
 
             //Visit the functions to clear the appropriate ptr before external calls
             for (auto F = M.begin(), Fend = M.end(); F != Fend; ++F) 
@@ -1849,6 +1925,10 @@ namespace {
                     continue; 
                 }
 
+                // Spp.setScalarEvolution(&getAnalysis<ScalarEvolutionWrapperPass>(*F).getSE());
+
+                // Spp.SCEVtest(&*F);
+
                 dbg(errs() << "Internal.. processing\n";)
                 changed = Spp.visitFunc(&*F);
             
@@ -1870,7 +1950,7 @@ namespace {
             //         // }
             //     }
             // }
-            
+
             dbg(errs() << M << "\n";)
             
             Spp.memCleanUp();
