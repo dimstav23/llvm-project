@@ -105,6 +105,7 @@ namespace {
         std::unordered_set <Value*> checkedPtrs;
 
         std::unordered_set <Instruction*> safeGEPs;
+        std::unordered_set <Instruction*> safeLDST;
     
         SPPPass(Module* M) 
         {
@@ -140,6 +141,7 @@ namespace {
             this->cxaPtrs.clear();
             this->checkedPtrs.clear();
             this->safeGEPs.clear();
+            this->safeLDST.clear();
         }
 
         std::string demangleName(StringRef str)
@@ -916,6 +918,12 @@ namespace {
             if (isa<GetElementPtrInst>(Ptr->stripPointerCasts())) 
             {
                 assert(!isMissedGep(cast<GetElementPtrInst>(Ptr->stripPointerCasts()), I));
+                auto *Gep = cast<GetElementPtrInst>(Ptr->stripPointerCasts());
+                if (safeGEPs.find(Gep) != safeGEPs.end())
+                {
+                    dbg(errs() << ">>Ignoring bounds check for preempted GEP : " << *Gep << " in " << *I << "\n";)
+                    return false;
+                }
             }
  
             if (isa<Constant>(Ptr->stripPointerCasts())) 
@@ -1238,8 +1246,7 @@ namespace {
         {
             for (auto BI = F->begin(); BI != F->end(); ++BI) 
             {
-                BasicBlock *BB = &*BI; 
-                Instruction *sucInst = &*(BB->begin());
+                BasicBlock *BB = &*BI;
 
                 for (auto II = BB->begin(); II != BB->end(); ++II) 
                 {    
@@ -1247,7 +1254,7 @@ namespace {
                     if (isa<LoadInst>(Ins) || isa<StoreInst>(Ins) || isa<AtomicRMWInst>(Ins) || isa<AtomicCmpXchgInst>(Ins)) 
                     {
                         Value* ptr = Ins->getOperand(getMemPointerOperandIdx(Ins));
-					    unsigned size = ptr->getType()->getPointerElementType()->getPrimitiveSizeInBits() / 8;
+					    // unsigned size = ptr->getType()->getPointerElementType()->getPrimitiveSizeInBits() / 8;
                         if (static_cast<SCEVTypes>(SE->getSCEV(ptr)->getSCEVType()) == scAddRecExpr) {
                             dbg(errs() << "entered " << __func__ << " with " << F->getName() <<"\n";)
                             analyzeScalarEvolutionInLoop(Ins);
@@ -1344,6 +1351,7 @@ namespace {
                 // will dominate all uses 
                 // GEPs[0] is the first one found and pushed in the vector
                 B.SetInsertPoint(GEPs[0]);
+                changed = true;
                 
                 // Sort the GEPs in the order in which they are dereferenced
                 std::sort(GEPs.begin(), GEPs.end(),
@@ -1367,8 +1375,10 @@ namespace {
                 }
                 dbg(errs() << "MaxOffset : " << MaxOffset << " in " << *MaxOffsetGEP << "\n";)
                 
-                // update the tag once and propagate the output to the spotted GEPs
-                // create hook prototype
+                /* 
+                 * update the tag once and 
+                 * propagate the output to the spotted GEPs
+                 */
                 Type *RetArgTy = Type::getInt8PtrTy(M->getContext());
                 Type *Arg2Ty = Type::getInt64Ty(M->getContext());
                 SmallVector <Type*, 2> tlist;
@@ -1389,20 +1399,41 @@ namespace {
 
                 Value *TmpPtr = B.CreateBitCast(MaxOffsetGEP->getPointerOperand(), hook.getFunctionType()->getParamType(0));
                 Value *IntOff = ConstantInt::get(hook.getFunctionType()->getParamType(1), MaxOffset);
-                //Value *IntOff = B.CreateSExt(MaxOffset, hook.getFunctionType()->getParamType(1));
                 
                 std::vector<Value*> args;
                 args.push_back(TmpPtr);
                 args.push_back(IntOff);
 
-                CallInst *Masked = B.CreateCall(hook, args);
-                Masked->setDoesNotThrow(); //to avoid it getting converted to invoke     
+                CallInst *TagUpdated = B.CreateCall(hook, args);
+                TagUpdated->setDoesNotThrow(); //to avoid it getting converted to invoke
+
+                /* 
+                 * insert checkbound call for the max bound
+                 * and propagate the clean ptr to the ld/st
+                 */
+                tlist.clear();
+                tlist.push_back(RetArgTy);
+                hookfty = FunctionType::get(RetArgTy, tlist, false);
+
+                if (pmemPtrs.find(MaxOffsetGEP->getPointerOperand()->stripPointerCasts()) != pmemPtrs.end())
+                {
+                    dbg(errs() << ">> Inserted __spp_checkbound_direct\n";)
+                    hook = M->getOrInsertFunction("__spp_checkbound_direct", hookfty);
+                }
+                else 
+                {
+                    hook = M->getOrInsertFunction("__spp_checkbound", hookfty);
+                }
+
+                CallInst *Masked = B.CreateCall(hook, TagUpdated); //cleaned and checked ptr for the max offset
+                Masked->setDoesNotThrow();
                 Value *UpdatedPtr = B.CreatePointerCast(Masked, MaxOffsetGEP->getPointerOperand()->getType());  
 
                 for (unsigned i = 0, n = GEPs.size(); i < n; ++i) {
                     GEPs[i]->setOperand(0, UpdatedPtr);
                     safeGEPs.insert(GEPs[i]);
                 }
+
                 dbg(errs() << "New BB:\n" << *BB << "\n";)
             }
             
@@ -1631,6 +1662,37 @@ namespace {
                                     default:
                                         break;
                                 }  
+                            }
+                        }
+                        // pmemobj_pool_by_ptr, pmemobj_tx_xadd_range_direct and pmemobj_tx_add_range_direct
+                        // only take PM ptrs as arguments
+                        else if ( CalleeF->getName().equals("pmemobj_pool_by_ptr") ||
+                                CalleeF->getName().equals("pmemobj_tx_xadd_range_direct") ||
+                                CalleeF->getName().equals("pmemobj_tx_add_range_direct"))
+                        {
+                            Value* PMptr = Ins->getOperand(0);
+                            dbg(errs() << ">> SPP pass PM ptr from PMDK funcs: " << *PMptr << " from " << *Ins << "\n";)
+                            std::vector <Value*> trackOrigins;
+                            trackOrigins.push_back(PMptr);
+
+                            while (!trackOrigins.empty())
+                            {                                
+                                Value* curr = trackOrigins.front();
+                                if (Instruction *iUser = dyn_cast<Instruction>(curr))
+                                {
+                                    switch (iUser->getOpcode()) 
+                                    {
+                                        case Instruction::BitCast:
+                                        case Instruction::GetElementPtr:
+                                            dbg(errs() << ">> SPP pass PM ptr from PMDK funcs:" << *iUser->getOperand(0) << "\n";)
+                                            pmemPtrs.insert(iUser->getOperand(0));
+                                            setSPPprefix(iUser->getOperand(0));
+                                            trackOrigins.push_back(iUser->getOperand(0));
+                                        default:
+                                            break;
+                                    }
+                                }
+                                trackOrigins.erase(trackOrigins.begin());
                             }
                         }
                     }
