@@ -93,7 +93,9 @@ struct SPPLTO : public ModulePass {
   virtual bool redundantCB(Function *F);
   virtual bool redundantTagUpdates(Function *F);
   virtual bool duplicateCleanTags(Function *F);
+  virtual bool duplicateUpdateTags(Function *FN);
   virtual bool duplicateCheckBounds(Function *F);
+  
 
   virtual bool trackPtrs (Function * F);
   virtual void trackFnArgs(Function* F);
@@ -321,12 +323,16 @@ doCallExternal(CallBase *CB)
     Type *vpty = Type::getInt8PtrTy(mod->getContext());
     FunctionType *fty = FunctionType::get(vpty, vpty, false);
     
-    FunctionCallee hook = 
+    FunctionCallee hook_generic = 
         mod->getOrInsertFunction("__spp_cleantag_external", fty); 
+    FunctionCallee hook_direct = 
+        mod->getOrInsertFunction("__spp_cleantag_external_direct", fty); 
 
     for (auto Arg = CB->arg_begin(); Arg != CB->arg_end(); ++Arg) 
     {   
         Value *ArgVal = dyn_cast<Value>(Arg);
+        FunctionCallee hook;
+
         if (!ArgVal) 
         {
             dbg(errs() << ">>Argument skipping.. Not a value\n";)
@@ -353,11 +359,16 @@ doCallExternal(CallBase *CB)
             dbg(errs() << ">>global or volatile ptr skipped cleaning: " << *CB << "\n";)
             continue;
         }
-        
-        // TODO: move to opt pass later.
-        //if (isSafePtr(From->stripPointerCasts())) {
-        //    continue; 
-        //}
+        else if (pmemPtrs.find(ArgVal->stripPointerCasts()) != pmemPtrs.end() ||
+                (CB->getCalledFunction() != NULL && CB->getCalledFunction()->getName().equals("pmemobj_pool_by_ptr")))
+        {
+            dbg(errs() << ">>direct cleantag external inserted for: " << *CB << "\n";)
+            hook = hook_direct;
+        }
+        else
+        {
+            hook = hook_generic;
+        }
 
         IRBuilder<> B(CB);
         vector <Value*> arglist;
@@ -464,7 +475,6 @@ SPPLTO::doCallBase(CallBase *cb)
     
     return changed;
 }
-
 
 void 
 SPPLTO::assessPtrArgs(Module* M)
@@ -842,6 +852,39 @@ SPPLTO::trackPtrs(Function* F)
                         }  
                     }
                 }
+                // pmemobj_pool_by_ptr, pmemobj_tx_xadd_range_direct and pmemobj_tx_add_range_direct
+                // only take PM ptrs as arguments
+                else if ( CalleeF->getName().equals("pmemobj_pool_by_ptr") ||
+                        CalleeF->getName().equals("pmemobj_tx_xadd_range_direct") ||
+                        CalleeF->getName().equals("pmemobj_tx_add_range_direct"))
+                {
+                    Value* PMptr = Ins->getOperand(0);
+                    dbg(errs() << ">> LTO pass PM ptr from PMDK funcs: " << *PMptr << " from " << *Ins << "\n";)
+                    std::vector <Value*> trackOrigins;
+                    trackOrigins.push_back(PMptr);
+                    pmemPtrs.insert(PMptr);
+                    setSPPprefix(PMptr);
+
+                    while (!trackOrigins.empty())
+                    {                                
+                        Value* curr = trackOrigins.front();
+                        if (Instruction *iUser = dyn_cast<Instruction>(curr))
+                        {
+                            switch (iUser->getOpcode()) 
+                            {
+                                case Instruction::BitCast:
+                                case Instruction::GetElementPtr:
+                                    dbg(errs() << ">> LTO pass PM ptr from PMDK funcs: " << *iUser->getOperand(0) << " from " << *Ins << "\n";)
+                                    pmemPtrs.insert(iUser->getOperand(0));
+                                    setSPPprefix(iUser->getOperand(0));
+                                    trackOrigins.push_back(iUser->getOperand(0));
+                                default:
+                                    break;
+                            }
+                        }
+                        trackOrigins.erase(trackOrigins.begin());
+                    }
+                }
                 //- PM ptr progataion for update tag -//
                 else if (CalleeF->getName().contains("__spp_updatetag")) {                    
                     dbg(errs() << "update tag prop candidate : " << *Ins <<" Arg: " << *CI->getArgOperand(0)->stripPointerCasts() << "\n";)
@@ -1085,6 +1128,51 @@ SPPLTO::duplicateCleanTags(Function *FN)
 }
 
 bool
+SPPLTO::duplicateUpdateTags(Function *FN)
+{
+    bool changed = false;
+    
+    for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
+    {
+        DenseMap<Value*, DenseMap<Value*, Value*>> updatedVals;
+        // DenseMap<Value*, Value*> updatedVals;
+        // DenseMap<Value*, Value*> offsetVals;
+        for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
+        { 
+            if (auto cb = dyn_cast<CallInst>(ins)) 
+            {
+                Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
+                if (cfn)
+                {
+                    // Check for redundant updatetag calls that are directly cleaned
+                    if (cfn->getName().contains("__spp_updatetag"))
+                    {
+                        Value* ArgVal = cb->getOperand(0)->stripPointerCasts();
+                        Value* Off = cb->getOperand(1)->stripPointerCasts();
+                        if (updatedVals.find(ArgVal) == updatedVals.end()) 
+                        {
+                            updatedVals[ArgVal][Off] = cb;
+                            // offsetVals[ArgVal].push_back(Off);
+                        }
+                        else 
+                        {
+                            if (updatedVals[ArgVal].find(Off) != updatedVals[ArgVal].end())
+                            {
+                                dbg(errs() << "there is a duplicate updatetag\n";)
+                                cb->replaceAllUsesWith(updatedVals[ArgVal][Off]);
+                                redundantChecks.push_back(cb);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        updatedVals.clear();
+    }
+    return changed;
+}
+
+bool
 SPPLTO::duplicateCheckBounds(Function *FN)
 {
     bool changed = false;
@@ -1296,7 +1384,7 @@ SPPLTO::redundantCB(Function *FN)
                                     if (!cb->use_empty())
                                         cb->replaceAllUsesWith(NewCI);
                                     // ReplaceInstWithInst(cb, NewCI);
-                                    dbg(errs() << "added " << *cb << " from " << FN->getName() << "\n";)
+                                    dbg(errs() << "added " << *NewCI << " from " << FN->getName() << "\n";)
                                     redundantChecks.push_back(cb);
                                     pmemPtrs.insert(NewCI);
                                 }
@@ -1459,8 +1547,6 @@ SPPLTO::runOnModule(Module &M)
 
     }
 
-    // errs() << M << "\n";
-
     //initial ptr tracking based on PTR derivation functions
     for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
     {
@@ -1480,6 +1566,7 @@ SPPLTO::runOnModule(Module &M)
     }
     assessPtrArgs(&M);
 
+    // errs() << M << "\n";
 
     for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
     {
@@ -1537,6 +1624,15 @@ SPPLTO::runOnModule(Module &M)
     for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
     { 
         duplicateCleanTags(&*Fn);
+    }
+
+    if (!hasZeroRedundantChecks()){
+        eraseRedundantChecks();
+    }
+
+    for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+    { 
+        duplicateUpdateTags(&*Fn);
     }
 
     if (!hasZeroRedundantChecks()){
