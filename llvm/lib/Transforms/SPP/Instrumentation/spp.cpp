@@ -921,7 +921,8 @@ namespace {
                 auto *Gep = cast<GetElementPtrInst>(Ptr->stripPointerCasts());
                 if (safeGEPs.find(Gep) != safeGEPs.end())
                 {
-                    dbg(errs() << ">>Ignoring bounds check for preempted GEP : " << *Gep << " in " << *I << "\n";)
+                    dbg(errs() << ">>Ignoring bounds check for preempted GEP : " << *I << " with " << *Gep << "\n";)
+                    checkedPtrs.insert(Ptr);
                     return false;
                 }
             }
@@ -990,13 +991,13 @@ namespace {
             int OpIdx = getOpIdx(I, Ptr);
             I->setOperand(OpIdx, NewPtr);
             dbg(errs() << ">> updated ld/st: " << *I << " ptr: " << *NewPtr << " stripped: " << *NewPtr->stripPointerCasts() << "\n";)
-            
+            dbg(errs() << "old ptr: " << *Ptr << " stripped: " << *Ptr->stripPointerCasts() << "\n";)
+            dbg(errs() << "new ptr: " << *NewPtr << " stripped: " << *NewPtr->stripPointerCasts() << "\n";)
+
             //replace subsequent uses of the same ptr in ld/st/atomic instructions
             checkedPtrs.insert(NewPtr);
             // checkedPtrs.insert(Ptr);
-            
-            dbg(errs() << "old ptr: " << *Ptr << " stripped: " << *Ptr->stripPointerCasts() << "\n";)
-            dbg(errs() << "new ptr: " << *NewPtr << " stripped: " << *NewPtr->stripPointerCasts() << "\n";)
+
             /* replace these */
             DenseMap<Instruction*, int> replaceChecked;
             for(auto U : Ptr->users()){  // U is of type User*
@@ -1374,7 +1375,7 @@ namespace {
                     }
                 }
                 dbg(errs() << "MaxOffset : " << MaxOffset << " in " << *MaxOffsetGEP << "\n";)
-                
+                dbg(errs() << "Initial BB:\n" << *BB << "\n";)
                 /* 
                  * update the tag once and 
                  * propagate the output to the spotted GEPs
