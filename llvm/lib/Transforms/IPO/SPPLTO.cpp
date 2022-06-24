@@ -7,6 +7,7 @@
 
 
 #include "llvm/Analysis/PostDominators.h"
+#include <llvm/IR/Dominators.h>
 #include "llvm/Analysis/Passes.h"
 #include "llvm/Analysis/TypeBasedAliasAnalysis.h"
 #include "llvm/Transforms/Scalar/GVN.h"
@@ -486,14 +487,14 @@ SPPLTO::assessPtrArgs(Module* M)
         operandType Type = it.second;
         if (ArgVal && Type == PM)
         {
-            dbg(errs() << "PM argument found " << *ArgVal << "\n";)
+            dbg(errs() << FnArgFun[ArgVal]->getName() << " PM argument found " << *ArgVal << "\n";)
             pmemPtrs.insert(ArgVal);
             setSPPprefix(ArgVal);
 
         }
         else if (ArgVal && Type == VOL)
         {
-            dbg(errs() << "VOL argument found " << *ArgVal << "\n";)
+            dbg(errs() << FnArgFun[ArgVal]->getName() << " VOL argument found " << *ArgVal << "\n";)
             untaggedPtrs.insert(ArgVal);
             std::vector<User*> Users(ArgVal->user_begin(), ArgVal->user_end());
             for (auto User : Users) 
@@ -670,7 +671,7 @@ SPPLTO::trackPtrs(Function* F)
             (Arg->hasAttribute(Attribute::ByVal) ||
              Arg->hasAttribute(Attribute::StructRet)))
         {
-            dbg(errs()<<">> Already Cleaned Argument ByVal " << *Arg <<  "\n";)
+            dbg(errs()<<">> Already Cleaned Argument ByVal/SRET " << *Arg <<  "\n";)
             untaggedPtrs.insert(Arg);  
             
             std::vector<User*> Users(Arg->user_begin(), Arg->user_end());
@@ -686,7 +687,7 @@ SPPLTO::trackPtrs(Function* F)
                     case Instruction::IntToPtr:
                     case Instruction::GetElementPtr:
                         untaggedPtrs.insert(Arg);
-                        dbg(errs() << ">>ByVal Arg ptr use: " << *iUser << "\n";)
+                        dbg(errs() << ">> ByVal/SRET Arg ptr use: " << *iUser << "\n";)
                     default:
                         break;
                 }                      
@@ -1092,9 +1093,9 @@ SPPLTO::duplicateCleanTags(Function *FN)
 {
     bool changed = false;
     
+    DenseMap<Value*, Value*> cleanedVals;
     for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
     {
-        DenseMap<Value*, Value*> cleanedVals;
         for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
         { 
             if (auto cb = dyn_cast<CallInst>(ins)) 
@@ -1113,17 +1114,25 @@ SPPLTO::duplicateCleanTags(Function *FN)
                         }
                         else 
                         {
-                            dbg(errs() << *cb << " duplicate cleantag : " << *ArgVal << "\n";)
-                            dbg(errs() << "should be replaced with: " << *cleanedVals[ArgVal] << "\n";)
-                            cb->replaceAllUsesWith(cleanedVals[ArgVal]);
-                            redundantChecks.push_back(cb);
+                            DominatorTree DT = DominatorTree(*FN);
+                            if (!DT.dominates(cleanedVals[ArgVal], cb))
+                            {
+                                dbg(errs() << "Non-dominated cleantag usage" << *cb << "\n";)
+                            }
+                            else
+                            {
+                                dbg(errs() << *cb << " duplicate cleantag : " << *ArgVal << "\n";)
+                                dbg(errs() << "should be replaced with: " << *cleanedVals[ArgVal] << "\n";)
+                                cb->replaceAllUsesWith(cleanedVals[ArgVal]);
+                                redundantChecks.push_back(cb);
+                            }
                         }
                     }
                 }
             }
         }
-        cleanedVals.clear();
     }
+    cleanedVals.clear();
     return changed;
 }
 
@@ -1132,9 +1141,10 @@ SPPLTO::duplicateUpdateTags(Function *FN)
 {
     bool changed = false;
     
+
+    DenseMap<Value*, DenseMap<Value*, Value*>> updatedVals;
     for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
     {
-        DenseMap<Value*, DenseMap<Value*, Value*>> updatedVals;
         // DenseMap<Value*, Value*> updatedVals;
         // DenseMap<Value*, Value*> offsetVals;
         for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
@@ -1144,11 +1154,12 @@ SPPLTO::duplicateUpdateTags(Function *FN)
                 Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
                 if (cfn)
                 {
-                    // Check for redundant updatetag calls that are directly cleaned
+                    // Check for redundant updatetag calls that have been performed already
                     if (cfn->getName().contains("__spp_updatetag"))
                     {
                         Value* ArgVal = cb->getOperand(0)->stripPointerCasts();
                         Value* Off = cb->getOperand(1)->stripPointerCasts();
+                        
                         if (updatedVals.find(ArgVal) == updatedVals.end()) 
                         {
                             updatedVals[ArgVal][Off] = cb;
@@ -1158,17 +1169,26 @@ SPPLTO::duplicateUpdateTags(Function *FN)
                         {
                             if (updatedVals[ArgVal].find(Off) != updatedVals[ArgVal].end())
                             {
-                                dbg(errs() << "there is a duplicate updatetag\n";)
-                                cb->replaceAllUsesWith(updatedVals[ArgVal][Off]);
-                                redundantChecks.push_back(cb);
+                                DominatorTree DT = DominatorTree(*FN);
+                                if (!DT.dominates(updatedVals[ArgVal][Off], cb))
+                                {
+                                    dbg(errs() << "Non-dominated updatetag usage" << *cb << "\n";)
+                                }
+                                else
+                                {
+                                    dbg(errs() << FN->getName() << " :there is a duplicate updatetag " << \
+                                                *updatedVals[ArgVal][Off] << "\n";)
+                                    cb->replaceAllUsesWith(updatedVals[ArgVal][Off]);
+                                    redundantChecks.push_back(cb);
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        updatedVals.clear();
     }
+    updatedVals.clear();
     return changed;
 }
 
@@ -1176,10 +1196,9 @@ bool
 SPPLTO::duplicateCheckBounds(Function *FN)
 {
     bool changed = false;
-    
+    DenseMap<Value*, Value*> checkedVals;
     for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
     {
-        DenseMap<Value*, Value*> checkedVals;
         for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
         { 
             if (auto cb = dyn_cast<CallInst>(ins)) 
@@ -1198,17 +1217,25 @@ SPPLTO::duplicateCheckBounds(Function *FN)
                         }
                         else 
                         {
-                            dbg(errs() << *cb << " duplicate checkbound : " << *ArgVal << "\n";)
-                            dbg(errs() << "should be replaced with: " << *checkedVals[ArgVal] << "\n";)
-                            cb->replaceAllUsesWith(checkedVals[ArgVal]);
-                            redundantChecks.push_back(cb);
+                            DominatorTree DT = DominatorTree(*FN);
+                            if (!DT.dominates(checkedVals[ArgVal], cb))
+                            {
+                                dbg(errs() << "Non-dominated checkbound usage" << *cb << "\n";)
+                            }
+                            else
+                            {
+                                dbg(errs() << *cb << " duplicate checkbound : " << *ArgVal << "\n";)
+                                dbg(errs() << "should be replaced with: " << *checkedVals[ArgVal] << "\n";)
+                                cb->replaceAllUsesWith(checkedVals[ArgVal]);
+                                redundantChecks.push_back(cb);
+                            }
                         }
                     }
                 }
             }
         }
-        checkedVals.clear();
     }
+    checkedVals.clear();
     return changed;
 }
 
@@ -1388,7 +1415,6 @@ SPPLTO::redundantCB(Function *FN)
                                     redundantChecks.push_back(cb);
                                     pmemPtrs.insert(NewCI);
                                 }
-
                             }
                             else 
                             {
@@ -1487,6 +1513,7 @@ SPPLTO::runOnFunction(Function *FN, Module &M)
             }
         }
     }
+
     return changed;
 }
 
@@ -1566,7 +1593,7 @@ SPPLTO::runOnModule(Module &M)
     }
     assessPtrArgs(&M);
 
-    // errs() << M << "\n";
+    dbg(errs() << M << "\n";)
 
     for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
     {
