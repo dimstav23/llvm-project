@@ -915,6 +915,15 @@ namespace {
             dbg(errs() << ">>" << __func__ << "Ptr: " << *Ptr << " stripped: " \
                         << *Ptr->stripPointerCasts() << " type : " << *Ptr->stripPointerCasts()->getType() << "\n";)
             
+            if ( safeLDST.find(I) != safeLDST.end() )
+            {
+                dbg(errs() << ">>Ignoring bounds check for safe LD/ST : " << *I << \
+                          " with " << *Ptr << " in function " << \
+                          I->getParent()->getParent()->getName() << "\n";)
+                checkedPtrs.insert(Ptr);
+                return false;
+            }
+
             if (isa<GetElementPtrInst>(Ptr->stripPointerCasts())) 
             {
                 assert(!isMissedGep(cast<GetElementPtrInst>(Ptr->stripPointerCasts()), I));
@@ -926,7 +935,7 @@ namespace {
                     return false;
                 }
             }
- 
+
             if (isa<Constant>(Ptr->stripPointerCasts())) 
             {
                 dbg(errs() << ">>" << __func__ << " constant skipping boundscheck: " \
@@ -1266,6 +1275,27 @@ namespace {
             return false;
         }
 
+        void markSafeLDST(Instruction *I, BasicBlock *BB) {
+            for (User *U : I->users()) {
+                if (cast<Instruction>(U)->getParent() != BB) {
+                    continue;
+                }
+                else if (auto *SI = dyn_cast<StoreInst>(U)) {
+                    if (SI->getPointerOperand() == I) {
+                        dbg(errs() << "safe st: " << *SI << "\n";)
+                        safeLDST.insert(SI);
+                    }
+                }
+                else if (auto *LI = dyn_cast<LoadInst>(U)) {
+                    if (LI->getPointerOperand() == I) {
+                        dbg(errs() << "safe ld: " << *LI << "\n";)
+                        safeLDST.insert(LI);
+                    }
+                }
+            }
+            return;
+        }
+
         static bool isOnlyUsedAndDereferencedInBlock(Instruction *I, BasicBlock *BB) {
             for (User *U : I->users()) {
                 if (cast<Instruction>(U)->getParent() != BB) {
@@ -1433,6 +1463,7 @@ namespace {
                 for (unsigned i = 0, n = GEPs.size(); i < n; ++i) {
                     GEPs[i]->setOperand(0, UpdatedPtr);
                     safeGEPs.insert(GEPs[i]);
+                    markSafeLDST(GEPs[i], BB);
                 }
 
                 dbg(errs() << "New BB:\n" << *BB << "\n";)
