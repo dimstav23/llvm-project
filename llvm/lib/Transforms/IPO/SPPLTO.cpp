@@ -1242,7 +1242,7 @@ bool
 SPPLTO::mergeTagUpdates(Function *FN)
 {
     bool changed = false;
-
+    dbg(errs() << FN->getName() << "\n";)
     for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
     {
         Module* M = BB->getModule();
@@ -1262,7 +1262,6 @@ SPPLTO::mergeTagUpdates(Function *FN)
                         
                         if (ArgVal && isa<Constant>(Off))
                         {
-                            bool canBeMerged = false;
                             // if the returned value has one use and this is in a GEP
                             // this updatetag can be merged with the one following the GEP
                             if (cb->hasOneUser())
@@ -1295,7 +1294,7 @@ SPPLTO::mergeTagUpdates(Function *FN)
                                                         updateCI->setOperand(1, newOff);
                                                         // remove the initial updatetag call
                                                         redundantChecks.push_back(cb);
-                                                        errs() << "results CI: " << *updateCI << " changed gep: " << *gep <<"\n";
+                                                        dbg(errs() << "results CI: " << *updateCI << " changed gep: " << *gep <<"\n";)
                                                     }
                                                 }
                                             }
@@ -1321,7 +1320,75 @@ SPPLTO::mergeTagUpdates(Function *FN)
                                                 updateCI->setOperand(1, newOff);
                                                 // remove the initial updatetag call
                                                 redundantChecks.push_back(cb);
+                                                dbg(errs() << "results CI: " << *updateCI << "\n";)
                                             }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        else if (ArgVal)
+                        {
+                            // if the returned value has one use and this is in a GEP
+                            // this updatetag can be merged with the one following the GEP
+                            if (cb->hasOneUser())
+                            {
+                                User *U = cb->user_back();
+                                if (auto *gep = dyn_cast<GetElementPtrInst>(U))
+                                {
+                                    dbg(errs() << *cb << " potential merge\n";)
+                                    // loop over the uses of the gep to find the updatetag 
+                                    // and merge with the initial one
+                                    std::vector<User*> Users(gep->user_begin(), gep->user_end());
+                                    for (auto User : Users) 
+                                    {
+                                        if (auto *updateCI= dyn_cast<CallInst>(User))
+                                        {
+                                            if (auto *fnCall = dyn_cast<Function>(updateCI->getCalledOperand()->stripPointerCasts()))
+                                            {
+                                                if (fnCall->getName().contains("__spp_updatetag")) {
+                                                    dbg(errs() << "merge via createAdd " << *cb << " with " << *updateCI << " using " << *gep << "\n";)
+                                                    //set the insert point before the updated instruction
+                                                    IRBuilder<> B(BB->getContext());
+                                                    B.SetInsertPoint(updateCI);
+                                                    
+                                                    //get the offset values and create their addition
+                                                    Value* firstOff = cb->getOperand(1);
+                                                    Value* secondOff = updateCI->getOperand(1);
+                                                    Value* newOff = B.CreateAdd(firstOff, secondOff);
+                                                    // change the GEP operand to the argument of the initial updatetag call
+                                                    gep->setOperand(0, ArgVal);
+                                                    // update the offset of the next updatetag with the offset of the first one
+                                                    updateCI->setOperand(1, newOff);
+                                                    // remove the initial updatetag call
+                                                    redundantChecks.push_back(cb);
+                                                    dbg(errs() << "results CI: " << *updateCI << " changed gep: " << *gep << " added: " << *newOff <<"\n";)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                else if (auto *updateCI = dyn_cast<CallInst>(U))
+                                {
+                                    if (auto *fnCall = dyn_cast<Function>(updateCI->getCalledOperand()->stripPointerCasts()))
+                                    {
+                                        if (fnCall->getName().contains("__spp_updatetag")) {
+                                            dbg(errs() << "direct merge via createAdd " << *cb << " with " << *updateCI << "\n";)
+                                            //set the insert point before the updated instruction
+                                            IRBuilder<> B(BB->getContext());
+                                            B.SetInsertPoint(updateCI);
+
+                                            //get the offset values and create their addition
+                                            Value* firstOff = cb->getOperand(1);
+                                            Value* secondOff = updateCI->getOperand(1);
+                                            Value* newOff = B.CreateAdd(firstOff, secondOff);
+                                            // update the ptr of the next updatetag with the ptr of the first one
+                                            updateCI->setOperand(0, ArgVal);
+                                            // update the offset of the next updatetag with the offset of the first one
+                                            updateCI->setOperand(1, newOff);
+                                            // remove the initial updatetag call
+                                            redundantChecks.push_back(cb);
+                                            dbg(errs() << "results CI: " << *updateCI << " added: " << *newOff <<"\n";)
                                         }
                                     }
                                 }
