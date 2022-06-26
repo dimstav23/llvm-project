@@ -96,7 +96,7 @@ struct SPPLTO : public ModulePass {
   virtual bool duplicateCleanTags(Function *F);
   virtual bool duplicateUpdateTags(Function *FN);
   virtual bool duplicateCheckBounds(Function *F);
-  
+  virtual bool mergeTagUpdates(Function *F);  
 
   virtual bool trackPtrs (Function * F);
   virtual void trackFnArgs(Function* F);
@@ -1140,7 +1140,6 @@ bool
 SPPLTO::duplicateUpdateTags(Function *FN)
 {
     bool changed = false;
-    
 
     DenseMap<Value*, DenseMap<Value*, Value*>> updatedVals;
     for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
@@ -1240,10 +1239,108 @@ SPPLTO::duplicateCheckBounds(Function *FN)
 }
 
 bool
-SPPLTO::redundantTagUpdates(Function *FN)
+SPPLTO::mergeTagUpdates(Function *FN)
 {
     bool changed = false;
 
+    for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
+    {
+        Module* M = BB->getModule();
+
+        for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
+        { 
+            if (auto cb = dyn_cast<CallInst>(ins)) 
+            {
+                Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
+                if (cfn)
+                {
+                    // Check for updatetag calls that can be merged
+                    if (cfn->getName().contains("__spp_updatetag"))
+                    {
+                        Value* ArgVal = cb->getOperand(0); // get the current ptr -- not the stripped
+                        Value* Off = cb->getOperand(1)->stripPointerCasts(); // strip the casts to check for constant;
+                        
+                        if (ArgVal && isa<Constant>(Off))
+                        {
+                            bool canBeMerged = false;
+                            // if the returned value has one use and this is in a GEP
+                            // this updatetag can be merged with the one following the GEP
+                            if (cb->hasOneUser())
+                            {
+                                User *U = cb->user_back();
+                                if (auto *gep = dyn_cast<GetElementPtrInst>(U))
+                                {
+                                    dbg(errs() << *cb << " potential merge\n";)
+                                    // loop over the uses of the gep to find the updatetag 
+                                    // and merge with the initial one
+                                    std::vector<User*> Users(gep->user_begin(), gep->user_end());
+                                    for (auto User : Users) 
+                                    {
+                                        if (auto *updateCI= dyn_cast<CallInst>(User))
+                                        {
+                                            if (auto *fnCall = dyn_cast<Function>(updateCI->getCalledOperand()->stripPointerCasts()))
+                                            {
+                                                if (fnCall->getName().contains("__spp_updatetag")) {
+                                                    Value* updOff = updateCI->getOperand(1)->stripPointerCasts();
+                                                    if (isa<Constant>(updOff))
+                                                    {
+                                                        dbg(errs() << "merge via gep " << *cb << " with " << *updateCI << "\n";)
+                                                        int64_t firstOff = (cast<ConstantInt>(Off))->getSExtValue();
+                                                        int64_t secondOff = (cast<ConstantInt>(updOff))->getSExtValue();
+                                                        int64_t totalOff = firstOff + secondOff;
+                                                        Value *newOff = ConstantInt::get(Type::getInt64Ty(M->getContext()), totalOff);
+                                                        // change the GEP operand to the argument of the initial updatetag call
+                                                        gep->setOperand(0, ArgVal);
+                                                        // update the offset of the next updatetag with the offset of the first one
+                                                        updateCI->setOperand(1, newOff);
+                                                        // remove the initial updatetag call
+                                                        redundantChecks.push_back(cb);
+                                                        errs() << "results CI: " << *updateCI << " changed gep: " << *gep <<"\n";
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                else if (auto *updateCI = dyn_cast<CallInst>(U))
+                                {
+                                    if (auto *fnCall = dyn_cast<Function>(updateCI->getCalledOperand()->stripPointerCasts()))
+                                    {
+                                        if (fnCall->getName().contains("__spp_updatetag")) {
+                                            Value* updOff = updateCI->getOperand(1)->stripPointerCasts();
+                                            if (isa<Constant>(updOff))
+                                            {
+                                                dbg(errs() << "direct merge " << *cb << " with " << *updateCI << "\n";)
+                                                int64_t firstOff = (cast<ConstantInt>(Off))->getSExtValue();
+                                                int64_t secondOff = (cast<ConstantInt>(updOff))->getSExtValue();
+                                                int64_t totalOff = firstOff + secondOff;
+                                                Value *newOff = ConstantInt::get(Type::getInt64Ty(M->getContext()), totalOff);
+                                                // update the ptr of the next updatetag with the ptr of the first one
+                                                updateCI->setOperand(0, ArgVal);
+                                                // update the offset of the next updatetag with the offset of the first one
+                                                updateCI->setOperand(1, newOff);
+                                                // remove the initial updatetag call
+                                                redundantChecks.push_back(cb);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return changed;
+}
+
+bool
+SPPLTO::redundantTagUpdates(Function *FN)
+{
+    bool changed = false;
+    
+    DenseMap<Value*, DenseMap<Value*, Value*>> updatedVals;
     for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
     {
         for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
@@ -1253,48 +1350,41 @@ SPPLTO::redundantTagUpdates(Function *FN)
                 Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
                 if (cfn)
                 {
-                    // Check for redundant updatetag calls that are directly cleaned
+                    // Check for redundant updatetag calls that have been performed already
                     if (cfn->getName().contains("__spp_updatetag"))
                     {
-                        bool redundant = true;
-                        std::vector<User*> Users(cb->user_begin(), cb->user_end());
-                        dbg(errs() << "update tag call " << *cb << "\n";)
-                        for (auto User : Users) 
+                        Value* ArgVal = cb->getOperand(0)->stripPointerCasts();
+                        Value* Off = cb->getOperand(1)->stripPointerCasts();
+                        
+                        if (updatedVals.find(ArgVal) == updatedVals.end()) 
                         {
-                            if (auto CI = dyn_cast<CallInst>(User))
-                            {
-                                Function *calledFn = dyn_cast<Function>(CI->getCalledOperand()->stripPointerCasts());
-                                if (calledFn && calledFn->getName().contains("__spp_cleantag"))
-                                    continue;
-                            }
-                            //if at least one use is not a cleantag, keep it in for now
-                            redundant = false;
-                            break;
+                            updatedVals[ArgVal][Off] = cb;
+                            // offsetVals[ArgVal].push_back(Off);
                         }
-                        // it's redundant, replace the ptr of the clean tag with the one of updatetag input
-                        // and erase the instruction
-                        if (redundant)
+                        else 
                         {
-                            dbg(errs() << "found update tag " << *cb << "\n";)
-                            for (auto User : Users) 
+                            if (updatedVals[ArgVal].find(Off) != updatedVals[ArgVal].end())
                             {
-                                if (auto CI = dyn_cast<CallInst>(User))
+                                DominatorTree DT = DominatorTree(*FN);
+                                if (!DT.dominates(updatedVals[ArgVal][Off], cb))
                                 {
-                                    Function *calledFn = dyn_cast<Function>(CI->getCalledOperand()->stripPointerCasts());
-                                    if (calledFn && calledFn->getName().contains("__spp_cleantag"))
-                                    {
-                                        CI->setOperand(0, cb->getOperand(0));
-                                    }
-                                    
+                                    dbg(errs() << "Non-dominated updatetag usage" << *cb << "\n";)
+                                }
+                                else
+                                {
+                                    dbg(errs() << FN->getName() << " :there is a duplicate updatetag " << \
+                                                *updatedVals[ArgVal][Off] << "\n";)
+                                    cb->replaceAllUsesWith(updatedVals[ArgVal][Off]);
+                                    redundantChecks.push_back(cb);
                                 }
                             }
-                            redundantChecks.push_back(cb);
                         }
                     }
                 }
             }
         }
     }
+    updatedVals.clear();
     return changed;
 }
 
@@ -1660,6 +1750,15 @@ SPPLTO::runOnModule(Module &M)
     for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
     { 
         duplicateUpdateTags(&*Fn);
+    }
+
+    if (!hasZeroRedundantChecks()){
+        eraseRedundantChecks();
+    }
+
+    for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+    { 
+        mergeTagUpdates(&*Fn);
     }
 
     if (!hasZeroRedundantChecks()){
