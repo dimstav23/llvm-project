@@ -104,6 +104,8 @@ namespace {
         std::unordered_set <Value*> cxaPtrs;
         std::unordered_set <Value*> checkedPtrs;
 
+        std::unordered_set <Value*> SCEVInst;
+
         std::unordered_set <Instruction*> safeGEPs;
         std::unordered_set <Instruction*> safeLDST;
     
@@ -142,6 +144,7 @@ namespace {
             this->checkedPtrs.clear();
             this->safeGEPs.clear();
             this->safeLDST.clear();
+            this->SCEVInst.clear();
         }
 
         std::string demangleName(StringRef str)
@@ -1184,75 +1187,216 @@ namespace {
 
             return true;
         }
-        
-        int getMemPointerOperandIdx(Instruction* I) {
-		    switch (I->getOpcode()) {
-            case Instruction::Load:
-                return cast<LoadInst>(I)->getPointerOperandIndex();
-            case Instruction::Store:
-                return cast<StoreInst>(I)->getPointerOperandIndex();
-            case Instruction::AtomicCmpXchg:
-                return cast<AtomicCmpXchgInst>(I)->getPointerOperandIndex();
-            case Instruction::AtomicRMW:
-                return cast<AtomicRMWInst>(I)->getPointerOperandIndex();
-            }
-            return -1;
-        }
 
-        void analyzeScalarEvolutionInLoop(Instruction* I) {
-            const SCEV* ptrSCEV = SE->getSCEV(I->getOperand(getMemPointerOperandIdx(I)));
-            const SCEVAddRecExpr *AR = cast<SCEVAddRecExpr>(ptrSCEV);
-
-            // we only work with expressions of form `A + B*x`
-            if (!AR->isAffine())  return;
-            // we only work with loops that have preheader (to put our optimized checks there)
-            if (!AR->getLoop()->getLoopPreheader())  return;
-            // we only work with memops that are guarantees to execute on each iteration
-            if (!isGuaranteedToExecuteForEveryIteration(I, AR->getLoop()))  return;
-
-            dbg(errs() << "entered " << __func__ << " with " << *I <<"\n";)
+        /*
+        * For GEPs inside loops, try to find the maximum possible offset and insert a
+        * dummy load before the loop to do the bounds check. tag the GEP inside the
+        * loop as safe to avoid arithmetic and masking in the later pass phase.
+        */
+        bool hoistGepBoundCheck(GetElementPtrInst *Gep) {
+            // TODO: also do this on GEPs that have only loop invariant operands
             
-            // insert dummy load from base-ptr in loop header: this will force
-            // the following instrumentation to insert corresponding bounds check;
-            // the load instruction itself will be optimized away later,
-            // moreover, the lower-bound load will also be optimized away if unneeded
-            // BasicBlock* preheader = AR->getLoop()->getLoopPreheader();
-            // IRBuilder<> IRB(preheader->getTerminator());
-            // const DataLayout &DL = preheader->getModule()->getDataLayout();
-            // SCEVExpander Expander(*SE, DL, "loopscevs");
+            if ( untaggedPtrs.find(Gep) != untaggedPtrs.end() ||
+                globalPtrs.find(Gep) != globalPtrs.end() ||
+                vtPtrs.find(Gep) != vtPtrs.end() )
+            {
+                dbg(errs() << ">>" << __func__ << " global or volatile GEP skipped hoisting: " << *Gep << "\n";)
+                return false;
+            }
 
-            // // insert code for start check
-            // Value* expanded = Expander.expandCodeFor(AR->getStart(), nullptr, preheader->getTerminator());
-            // Instruction* startI = IRB.CreateLoad(expanded, "dummyoptimizationloadstart");
+            // check if gep can be analysed with Scalar Evolution
+            if (!SE->isSCEVable(Gep->getType()))
+                return false;
 
-            // // insert code for exit check if possible (works for simple loops with one exit)
-            // Instruction* exitI = nullptr;
-            // const SCEV *ExitValue = SE->getSCEVAtScope(AR, AR->getLoop()->getParentLoop());
-            // if (SE->isLoopInvariant(ExitValue, AR->getLoop())) {
-            //     expanded = Expander.expandCodeFor(ExitValue, nullptr, preheader->getTerminator());
-            //     exitI = IRB.CreateLoad(expanded, "dummyoptimizationloadexit");
-            //     // exit check's existence implies no checks are needed inside loop
-            //     markNoLowerBoundCheck(I);
-            //     markNoUpperBoundCheck(I);
-            // }
-            // // memorize pair "this meminst -> headerload", the following instrumentation
-            // // will recognize such meminsts and use headerload's extracted lo/up bounds
-            // assert(optimizedMemInsts.count(I) == 0 && "SE-Loop optimization analyzed instruction more than once?!");
-            // optimizedMemInsts[I] = startI;
+            // GEPs in loops have a particular type of SCEV
+            auto *AdRecExpr = dyn_cast<SCEVAddRecExpr>(SE->getSCEV(Gep));
+            if (!AdRecExpr)
+                return false;
+            
+            const Loop *L = AdRecExpr->getLoop();
+            BasicBlock *Preheader = L->getLoopPreheader();
 
-            // if (SE->isKnownPositive(AR->getStepRecurrence(*SE))) {
-            //     markNoLowerBoundCheck(I);
-            //     markNoUpperBoundCheck(startI);
-            //     if (exitI)  markNoLowerBoundCheck(exitI);
+            // Only handle natural loops:
+            // a loop has a preheader if there is only one edge to the header of the loop
+            // from outside of the loop and it is legal to hoist instructions into the
+            // predecessor. If this is the case, the block branching to the header of the
+            // loop is the preheader node.
+            if (!Preheader)
+                return false;
+
+            // Can only check bound before the loop if it is guaranteed to be checked
+            // inside the loop
+            if (!isGuaranteedToExecuteForEveryIteration(Gep, L))
+                return false;
+
+            // if (hasComputableLoopEvolution(AdRecExpr, L)) {
+            //     errs() << "computable loop evolution";
             // }
-            // if (SE->isKnownNegative(AR->getStepRecurrence(*SE))) {
-            //     markNoUpperBoundCheck(I);
-            //     markNoLowerBoundCheck(startI);
-            //     if (exitI)  markNoUpperBoundCheck(exitI);
-            // }
+
+            // Compute loop exit value
+            const SCEV *ExitExpr = SE->getSCEVAtScope(AdRecExpr, L->getParentLoop());
+            if (!SE->isLoopInvariant(ExitExpr, L))
+                return false;
+
+            // TODO: use hasComputableLoopEvolution and isSafeToExpand
+
+            dbg(errs() << "Gep: " << *Gep << "\n";)
+            dbg(errs() << "SCEV Add Rec Expr: " << *AdRecExpr << " Exit Expr: " << *ExitExpr << "\n";)
+
+            // Hoist exit pointer to preheader
+            Instruction *InsertPt = Preheader->getTerminator();
+            SCEVExpander Expander(*SE, *DL, "gep_expander");
+
+            Value* ExitValue = nullptr;
+            ConstantInt *ExitOff = nullptr;;
+
+            auto ExitValuePairs = Expander.getRelatedExistingExpansion(ExitExpr, InsertPt, const_cast<Loop*>(L));
+            if (ExitValuePairs.hasValue())
+            {
+                ExitValue = ExitValuePairs.getValue().first;
+                ExitOff = ExitValuePairs.getValue().second;
+                assert(!ExitOff && "Exit offset not taken into consideration");
+            }
+            if (!ExitValue)
+                ExitValue = Expander.expandCodeFor(ExitExpr, nullptr, InsertPt);
+            
+            assert(ExitValue && "We should have an exit value here");
+            dbg(errs() << "Exit Value " << *ExitValue << "\n";)
+
+            // markIntermediateExpandedInstsAsSafe(Expander, ExitValue);
+            std::string Prefix = Gep->hasName() ? Gep->getName().str() + "." : "";
+
+            // Find uses of the GEP outside the loop and replace them with the (tagged)
+            // dummy value so that bounds checks continue to happen after the loop
+            TinyPtrVector<Instruction*> UsersOutsideLoop;
+            for (auto *Use : Gep->users())
+            {
+                if (Instruction *I = cast<Instruction>(Use))
+                {
+                    if (!L->contains(I))
+                        UsersOutsideLoop.push_back(I);
+                }
+            }
+            for (Instruction *I : UsersOutsideLoop) {
+                I->replaceUsesOfWith(Gep, ExitValue);
+            }
+
+            // if the base is already untagged
+            // insert the GEP as untagged + safe
+            // and return
+            Value *Base = Gep->getPointerOperand();
+            if ( untaggedPtrs.find(Base) != untaggedPtrs.end() ||
+                globalPtrs.find(Base) != globalPtrs.end() ||
+                vtPtrs.find(Base) != vtPtrs.end() )
+            {
+                safeGEPs.insert(Gep);
+                untaggedPtrs.insert(Gep);
+                return true;
+            }
+
+            // If the loop is not known to count up, check the entry value
+            const SCEV *Step = AdRecExpr->getStepRecurrence(*SE);
+            if (!SE->isKnownPositive(Step)) 
+            {
+                dbg(errs() << "Not known as positive: " << *Step << "\n";)
+                const SCEV *EntryExpr = AdRecExpr->getStart();
+                assert(SE->isLoopInvariant(EntryExpr, L));
+                dbg(errs() << "Entry expr: " << *EntryExpr << "\n";)
+
+                auto EntryValuePairs = Expander.getRelatedExistingExpansion(EntryExpr, InsertPt, const_cast<Loop*>(L));
+                Value* EntryValue = nullptr;
+                ConstantInt *EntryOff = nullptr;
+                if (EntryValuePairs.hasValue())
+                {
+                    EntryValue = EntryValuePairs.getValue().first;
+                    EntryOff = EntryValuePairs.getValue().second;
+                    assert(!EntryOff && "Entry offset not taken into consideration");                    
+                }       
+                
+                // if entry value not found, insert appropriate command to identify it
+                if (!EntryValue) {
+                    EntryValue = Expander.expandCodeFor(EntryExpr, nullptr, InsertPt);
+                    // SCEVInst.insert(EntryValue);
+                }
+                
+                assert(EntryValue && "We should have an entry value here");  
+               
+                if (PointerType* PtrTy = dyn_cast<PointerType>(EntryValue->getType()))
+                    SCEVInst.insert(new LoadInst(PtrTy->getElementType(), EntryValue, Prefix + "spp_entry_ld", true, InsertPt));
+                else
+                    assert(PtrTy && "SCEV Entry value not a pointer type!");
+            }
+
+            // If the loop is not known to count down, check the exit value
+            if (!SE->isKnownNegative(Step))
+            {
+                dbg(errs() << "Not known as negative: " << *Step << "\n";)
+                if (PointerType* PtrTy = dyn_cast<PointerType>(ExitValue->getType()))
+                    SCEVInst.insert(new LoadInst(PtrTy->getElementType(), ExitValue, Prefix + "spp_exit_ld", true, InsertPt));
+                else
+                    assert(PtrTy && "SCEV Entry value not a pointer type!");
+            }
+
+            // Mask the base pointer once in the preheader if possible
+            IRBuilder<> B(InsertPt);
+            if (!L->isLoopInvariant(Base)) {
+                dbg(errs() << "Base << " << *Base << " is not loop invariant\n";)
+                // TODO: only mask once for each base in the same BB
+                B.SetInsertPoint(Gep);
+            }
+            // clean the tag and replace the gep
+            Type *RetArgTy = Type::getInt8PtrTy(M->getContext());
+            SmallVector <Type*, 1> tlist;
+            tlist.push_back(RetArgTy);
+            FunctionType *hookfty = FunctionType::get(RetArgTy, RetArgTy, false);
+            FunctionCallee hook;
+            if (pmemPtrs.find(Base->stripPointerCasts()) != pmemPtrs.end())
+            {
+                dbg(errs() << "__spp_cleantag_direct\n";)
+                hook = M->getOrInsertFunction("__spp_cleantag_direct", hookfty);
+            }
+            else 
+            {
+                hook = M->getOrInsertFunction("__spp_cleantag", hookfty);
+            }
+
+            Value *TmpPtr = B.CreateBitCast(Base, hook.getFunctionType()->getParamType(0));
+            CallInst *Masked = B.CreateCall(hook, TmpPtr);
+            Masked->setDoesNotThrow();
+            Value *MaskedBase = B.CreatePointerCast(Masked, Base->getType());
+            untaggedPtrs.insert(MaskedBase);
+
+            Gep->setOperand(0, MaskedBase);
+            
+
+            // Prevent further instrumentation inside the loop
+            safeGEPs.insert(Gep);
+            untaggedPtrs.insert(Gep);
+            dbg(errs() << "Preheader updated: \n" << *Preheader;)
+            dbg(errs() << *Gep->getParent();)
+
+            return true;
         }
 
-        bool SCEVtest(Function* F) 
+        bool removeSCEVInstr()
+        {
+            bool changed = false;
+            dbg(errs() << ">>ERASE_size: " << SCEVInst.size() << "\n";)
+            for (auto *erase : SCEVInst)
+            {
+                if (auto *eraseI = dyn_cast<Instruction>(erase))
+                {                
+                    dbg(errs() << i << ">>ERASE: " << *eraseI << "\n";)
+                    eraseI->eraseFromParent();
+                    changed = true;
+                }
+            }
+            dbg(errs() << ">>ERASE_done\n";)
+            SCEVInst.clear();
+            return changed;
+        }
+
+        bool SCEVFnAnalysis(Function* F) 
         {
             for (auto BI = F->begin(); BI != F->end(); ++BI) 
             {
@@ -1261,13 +1405,11 @@ namespace {
                 for (auto II = BB->begin(); II != BB->end(); ++II) 
                 {    
                     Instruction *Ins= &*II;
-                    if (isa<LoadInst>(Ins) || isa<StoreInst>(Ins) || isa<AtomicRMWInst>(Ins) || isa<AtomicCmpXchgInst>(Ins)) 
+                    if (auto *gep = dyn_cast<GetElementPtrInst>(Ins)) 
                     {
-                        Value* ptr = Ins->getOperand(getMemPointerOperandIdx(Ins));
-					    // unsigned size = ptr->getType()->getPointerElementType()->getPrimitiveSizeInBits() / 8;
-                        if (static_cast<SCEVTypes>(SE->getSCEV(ptr)->getSCEVType()) == scAddRecExpr) {
-                            dbg(errs() << "entered " << __func__ << " with " << F->getName() <<"\n";)
-                            analyzeScalarEvolutionInLoop(Ins);
+                        if (hoistGepBoundCheck(gep)) {
+                            dbg(errs() << F->getName() << "\n";)
+                            dbg(errs() << *BB << "\n";)
                         }
                     }
                 }
@@ -1369,7 +1511,6 @@ namespace {
             IRBuilder<> B(BB->getContext());
 
             for (auto P : InternalGEPs) {
-                Value *Base = P.first; // the ptr GEPs refer to
                 SmallVector<GetElementPtrInst*, 4> &GEPs = P.second;
 
                 // Only consider each base pointer that have multiple uses in the block
@@ -2019,15 +2160,16 @@ namespace {
                     continue; 
                 }
 
-                // Spp.setScalarEvolution(&getAnalysis<ScalarEvolutionWrapperPass>(*F).getSE());
-
-                // Spp.SCEVtest(&*F);
+                Spp.setScalarEvolution(&getAnalysis<ScalarEvolutionWrapperPass>(*F).getSE());
+                Spp.SCEVFnAnalysis(&*F);
 
                 dbg(errs() << "Internal.. processing\n";)
                 changed = Spp.visitFunc(&*F);
             
             }
             
+            Spp.removeSCEVInstr();
+
             errs() << ">>Running_SPP_Module_Pass exiting...\n";
 
             // for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
