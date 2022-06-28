@@ -204,11 +204,6 @@ static void setSPPprefix(Value *V) {
     V->setName(Twine("spp.pm.") + V->getName());
 }
 
-static bool hasZeroRedundantChecks()
-{
-    return redundantChecks.empty();
-}
-
 static void eraseRedundantChecks() 
 { 
     dbg(errs()<<">>ERASE_size: "<<redundantChecks.size()<<"\n";)
@@ -282,8 +277,10 @@ doCallExternal(CallBase *CB)
     bool changed = false;
 
     // Skip tag cleaning for certain transaction functions
-    if (CB->getCalledFunction() != NULL && 
-        CB->getCalledFunction()->getName().contains("pmemobj_tx_add_range_direct")) 
+    if (CB->getCalledFunction() != NULL &&
+        (CB->getCalledFunction()->getName().contains("pmemobj_tx_add_range_direct") || 
+         CB->getCalledFunction()->getName().equals("pthread_create") ||
+         CB->getCalledFunction()->getName().equals("pthread_cond_signal")))
     {
         return changed;
     }
@@ -614,8 +611,8 @@ SPPLTO::propagateFnArgsTypes(Function* F)
                                 FnArgType[FnArg] = UKNOWN;
                         }
                         else if (untaggedPtrs.find(ArgVal->stripPointerCasts()) != untaggedPtrs.end() ||
-                                    globalPtrs.find(ArgVal->stripPointerCasts()) != globalPtrs.end() ||
-                                    vtPtrs.find(ArgVal->stripPointerCasts()) != vtPtrs.end())
+                                globalPtrs.find(ArgVal->stripPointerCasts()) != globalPtrs.end() ||
+                                vtPtrs.find(ArgVal->stripPointerCasts()) != vtPtrs.end())
                         {
                             Value* FnArg = CalleeF->getArg(argIdx);
                             if (FnArgType[FnArg] == MAX_TYPE)
@@ -665,13 +662,16 @@ SPPLTO::trackPtrs(Function* F)
 {
 
     dbg(errs() << "Function: " << F->getName() << "\n";)
+    
+    // Arguments of main are volatile ptrs 
+    // all the byval or sret arguments are untagged
     for (auto Arg = F->arg_begin(); Arg != F->arg_end(); ++Arg) 
     {
         if (Arg->getType()->isPointerTy() && 
-            (Arg->hasAttribute(Attribute::ByVal) ||
-             Arg->hasAttribute(Attribute::StructRet)))
+            (F->getName().equals("main") ||
+            (Arg->hasAttribute(Attribute::ByVal) || Arg->hasAttribute(Attribute::StructRet))))
         {
-            dbg(errs()<<">> Already Cleaned Argument ByVal/SRET " << *Arg <<  "\n";)
+            dbg(errs()<<">> Already Cleaned Argument ByVal/SRET/main " << *Arg <<  "\n";)
             untaggedPtrs.insert(Arg);  
             
             std::vector<User*> Users(Arg->user_begin(), Arg->user_end());
@@ -687,7 +687,7 @@ SPPLTO::trackPtrs(Function* F)
                     case Instruction::IntToPtr:
                     case Instruction::GetElementPtr:
                         untaggedPtrs.insert(Arg);
-                        dbg(errs() << ">> ByVal/SRET Arg ptr use: " << *iUser << "\n";)
+                        dbg(errs() << ">> ByVal/SRET/main Arg ptr use: " << *iUser << "\n";)
                     default:
                         break;
                 }                      
@@ -797,7 +797,48 @@ SPPLTO::trackPtrs(Function* F)
                             }  
                         }
                     }
-                } 
+                }
+                // Arguments of pthread calls are volatile ptrs 
+                else if (CalleeF->getName().equals("pthread_create") || //pthread_create variables
+                         CalleeF->getName().equals("pthread_cond_signal")) //pthread_cond variables
+                {
+                    for (auto Op = Ins->op_begin(); Op != Ins->op_end(); ++Op) 
+                    {
+                        Value *ArgVal = dyn_cast<Value>(Op);
+                        if (!ArgVal->getType()->isPointerTy())
+                            continue;
+                        
+                        Value *Operand = ArgVal->stripPointerCasts();
+
+                        dbg(errs()<<"call to pthread function with ptr: " << *Ins << " Op : " << *Operand << "\n";)
+                        
+                        // This check exists for the case of a mid-pipeline optimization pass
+                        // where free func can get null argument before being eliminated
+                        if (!isa<ConstantPointerNull>(Operand))
+                        {
+                            untaggedPtrs.insert(Operand);
+
+                            std::vector<User*> Users(Operand->user_begin(), Operand->user_end());
+                            for (auto User : Users) 
+                            {
+                                Instruction *iUser= dyn_cast<Instruction>(User);
+                                dbg(errs() << ">>pthread fn arg ptr use: " << *iUser << "\n";)
+
+                                // mark directly derived values as volatile:
+                                switch (iUser->getOpcode()) 
+                                {
+                                    case Instruction::BitCast:
+                                    case Instruction::PtrToInt:
+                                    case Instruction::IntToPtr:
+                                    case Instruction::GetElementPtr:
+                                        untaggedPtrs.insert(iUser);
+                                    default:
+                                        break;
+                                }  
+                            }
+                        }
+                    }
+                }
                 //- already cleaned ptr -//
                 else if (CalleeF->getName().contains("__spp_cleantag") ||
                     CalleeF->getName().contains("__spp_memintr_check_and_clean") ||
@@ -1786,60 +1827,81 @@ SPPLTO::runOnModule(Module &M)
     }
 
     // errs() << M << "\n";
-
-    for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
-    { 
-        redundantCB(&*Fn);
-    }
-
-    if (!hasZeroRedundantChecks()) {
-        eraseRedundantChecks();
-    }
     
-    for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
-    { 
-        redundantTagUpdates(&*Fn);
-    }
-
-    if (!hasZeroRedundantChecks()){
+    int postProcessedInst;
+    do {
+        postProcessedInst = 0;
+        for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+        { 
+            redundantCB(&*Fn);
+        }
+        postProcessedInst += redundantChecks.size();
         eraseRedundantChecks();
-    }
-
-    for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
-    { 
-        duplicateCleanTags(&*Fn);
-    }
-
-    if (!hasZeroRedundantChecks()){
+        
+        
+        for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+        { 
+            redundantTagUpdates(&*Fn);
+        }
+        postProcessedInst += redundantChecks.size();
         eraseRedundantChecks();
-    }
 
-    for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
-    { 
-        duplicateUpdateTags(&*Fn);
-    }
 
-    if (!hasZeroRedundantChecks()){
+        for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+        { 
+            duplicateCleanTags(&*Fn);
+        }
+        postProcessedInst += redundantChecks.size();
         eraseRedundantChecks();
-    }
+        
 
-    for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
-    { 
-        mergeTagUpdates(&*Fn);
-    }
-
-    if (!hasZeroRedundantChecks()){
+        for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+        { 
+            duplicateUpdateTags(&*Fn);
+        }
+        postProcessedInst += redundantChecks.size();
         eraseRedundantChecks();
-    }
+        
 
-    for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
-    { 
-        duplicateCheckBounds(&*Fn);
-    }
-
-    if (!hasZeroRedundantChecks()){
+        for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+        { 
+            mergeTagUpdates(&*Fn);
+        }
+        postProcessedInst += redundantChecks.size();
         eraseRedundantChecks();
-    }
+        
+
+        for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+        { 
+            duplicateCheckBounds(&*Fn);
+        }
+        postProcessedInst += redundantChecks.size();
+        eraseRedundantChecks();
+
+        dbg(errs() << "post processed inst: " << postProcessedInst << "\n";)
+    } while(postProcessedInst!=0);
+
+    // for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+    // { 
+    //     int cnt = 0;
+    //     for (auto BB = Fn->begin(); BB != Fn->end(); ++BB) 
+    //     {
+    //         for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
+    //         {
+    //             if (auto cb = dyn_cast<CallBase>(ins)) 
+    //             {
+    //                 Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
+    //                 if (cfn) 
+    //                 {
+    //                     StringRef fname = cfn->getName();
+    //                     if (fname.contains("__spp_memintr_check_and_clean"))
+    //                         cnt++;
+    //                 }
+    //             }
+    //         }
+    //     }
+    //     errs() << Fn->getName() << " memintr_checks : " << cnt << "\n";
+    // }
 
     // for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
     // {
