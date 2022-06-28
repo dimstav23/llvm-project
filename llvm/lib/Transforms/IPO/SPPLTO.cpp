@@ -92,11 +92,12 @@ struct SPPLTO : public ModulePass {
   }
   
   virtual bool redundantCB(Function *F);
-  virtual bool redundantTagUpdates(Function *F);
+  virtual bool duplicateTagUpdates(Function *F);
   virtual bool duplicateCleanTags(Function *F);
-  virtual bool duplicateUpdateTags(Function *FN);
+  virtual bool duplicateUpdateTags(Function *F);
   virtual bool duplicateCheckBounds(Function *F);
-  virtual bool mergeTagUpdates(Function *F);  
+  virtual bool mergeTagUpdates(Function *F);
+  virtual bool redundantTagUpdates(Function *F);  
 
   virtual bool trackPtrs (Function * F);
   virtual void trackFnArgs(Function* F);
@@ -106,7 +107,7 @@ struct SPPLTO : public ModulePass {
   virtual bool runOnFunction (Function * F, Module &M);
   virtual bool runOnModule(Module &M) override;
 
-  bool doCallBase (CallBase * ins);
+  virtual bool doCallBase (CallBase * ins);
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     //AU.addRequired<DominatorTreeWrapperPass>();
@@ -1444,7 +1445,7 @@ SPPLTO::mergeTagUpdates(Function *FN)
 }
 
 bool
-SPPLTO::redundantTagUpdates(Function *FN)
+SPPLTO::duplicateTagUpdates(Function *FN)
 {
     bool changed = false;
     
@@ -1464,6 +1465,7 @@ SPPLTO::redundantTagUpdates(Function *FN)
                         Value* ArgVal = cb->getOperand(0)->stripPointerCasts();
                         Value* Off = cb->getOperand(1)->stripPointerCasts();
                         
+                        // duplicate tag updates
                         if (updatedVals.find(ArgVal) == updatedVals.end()) 
                         {
                             updatedVals[ArgVal][Off] = cb;
@@ -1493,6 +1495,97 @@ SPPLTO::redundantTagUpdates(Function *FN)
         }
     }
     updatedVals.clear();
+    return changed;
+}
+
+bool
+SPPLTO::redundantTagUpdates(Function *FN)
+{
+    bool changed = false;
+    
+    for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
+    {
+        for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
+        { 
+            if (auto cb = dyn_cast<CallInst>(ins)) 
+            {
+                Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
+                if (cfn)
+                {
+                    // Check for redundant updatetag calls that have been performed already
+                    if (cfn->getName().contains("__spp_cleantag"))
+                    {
+                        Value* ArgVal = cb->getOperand(0)->stripPointerCasts();
+                        if (auto ArgInst = dyn_cast<CallInst>(ArgVal))
+                        {
+                            if (auto ArgFnCall = dyn_cast<Function>(ArgInst->getCalledOperand()->stripPointerCasts()))
+                            {
+                                if (ArgFnCall->getName().contains("__spp_updatetag"))
+                                {
+                                    if (ArgVal->hasOneUser())
+                                    {
+                                        dbg(errs() << "redundant updatetag :" << *ArgVal << "\n";)
+                                        dbg(errs() << "cleantag callback :" << *cb << "\n";)
+                                        dbg(errs() << "replace operand with " << *ArgInst->getOperand(0) << "\n";)
+                                        cb->setOperand(0, ArgInst->getOperand(0));
+                                        dbg(errs() << "updated cleantag callback :" << *cb << "\n";)
+                                        ArgInst->replaceAllUsesWith(ArgInst->getOperand(0));
+                                        redundantChecks.push_back(ArgInst);
+                                    }
+                                    else 
+                                    {
+                                        dbg(errs() << "\nCheck" << *ArgVal << "\n";)
+                                        dbg(errs() << *BB;)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
+    // {
+    //     for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
+    //     { 
+    //         if (auto cb = dyn_cast<CallInst>(ins)) 
+    //         {
+    //             Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
+    //             if (cfn)
+    //             {
+    //                 // Check for redundant updatetag calls that have been performed already
+    //                 if (cfn->getName().contains("__spp_checkbound"))
+    //                 {
+    //                     Value* ArgVal = cb->getOperand(0)->stripPointerCasts();
+    //                     if (auto ArgInst = dyn_cast<CallInst>(ArgVal))
+    //                     {
+    //                         if (auto ArgFnCall = dyn_cast<Function>(ArgInst->getCalledOperand()->stripPointerCasts()))
+    //                         {
+    //                             if (ArgFnCall->getName().contains("__spp_updatetag"))
+    //                             {
+    //                                 if (ArgVal->hasOneUser())
+    //                                 {
+    //                                     // Merge updatetag + checkbound in a function call
+    //                                     errs() << "redundant checkbound :" << *ArgVal << "\n";
+    //                                     errs() << "checkbound callback :" << *cb << "\n";
+    //                                     errs() << "replace operand with " << *ArgInst->getOperand(0) << "\n";
+    //                                     cb->setOperand(0, ArgInst->getOperand(0));
+    //                                     errs() << "updated checkbound callback :" << *cb << "\n";
+    //                                     ArgInst->replaceAllUsesWith(ArgInst->getOperand(0));
+    //                                     redundantChecks.push_back(ArgInst);
+    //                                 }
+    //                             }
+    //                         }
+    //                     }
+                        
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
+
     return changed;
 }
 
@@ -1838,10 +1931,9 @@ SPPLTO::runOnModule(Module &M)
         postProcessedInst += redundantChecks.size();
         eraseRedundantChecks();
         
-        
         for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
         { 
-            redundantTagUpdates(&*Fn);
+            duplicateTagUpdates(&*Fn);
         }
         postProcessedInst += redundantChecks.size();
         eraseRedundantChecks();
@@ -1870,6 +1962,12 @@ SPPLTO::runOnModule(Module &M)
         postProcessedInst += redundantChecks.size();
         eraseRedundantChecks();
         
+        for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+        { 
+            redundantTagUpdates(&*Fn);
+        }
+        postProcessedInst += redundantChecks.size();
+        eraseRedundantChecks();
 
         for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
         { 
