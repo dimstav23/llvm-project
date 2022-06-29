@@ -98,6 +98,7 @@ struct SPPLTO : public ModulePass {
   virtual bool duplicateCheckBounds(Function *F);
   virtual bool mergeTagUpdates(Function *F);
   virtual bool mergeTagUpdatesCheckbounds(Function *F);
+  virtual bool mergeTagUpdatesMemChecks(Function *F);
   virtual bool redundantTagUpdates(Function *F);  
 
   virtual bool trackPtrs (Function * F);
@@ -1634,7 +1635,7 @@ SPPLTO::mergeTagUpdatesCheckbounds(Function *FN)
                                         FunctionType *fty = ArgFnCall->getFunctionType();
                                         FunctionCallee hook = mod->getOrInsertFunction(FnName, fty); 
                                         vector <Value*> arglist(ArgInst->arg_begin(), ArgInst->arg_end());
-                                        CallInst *NewCI = B.CreateCall(hook, arglist);                         
+                                        CallInst *NewCI = B.CreateCall(hook, arglist, "spp_upd_cb.");                         
                                         NewCI->setDoesNotThrow();
 
                                         // replace the use of the updated tag
@@ -1657,6 +1658,14 @@ SPPLTO::mergeTagUpdatesCheckbounds(Function *FN)
             }
         }
     }
+    return changed;
+}
+
+bool
+SPPLTO::mergeTagUpdatesMemChecks(Function *FN)
+{
+    bool changed = false;
+
     for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
     {
         for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
@@ -1667,9 +1676,11 @@ SPPLTO::mergeTagUpdatesCheckbounds(Function *FN)
                 if (cfn)
                 {
                     // Check for redundant updatetag calls that have been performed already
-                    if (cfn->getName().contains("__spp_memintr_check"))
+                    if (cfn->getName().contains("__spp_memintr_check_and_clean"))
                     {
                         Value* ArgVal = cb->getOperand(0)->stripPointerCasts();
+                        Value* MemIntrOff = cb->getOperand(1)->stripPointerCasts();
+
                         if (auto ArgInst = dyn_cast<CallInst>(ArgVal))
                         {
                             if (auto ArgFnCall = dyn_cast<Function>(ArgInst->getCalledOperand()->stripPointerCasts()))
@@ -1679,31 +1690,55 @@ SPPLTO::mergeTagUpdatesCheckbounds(Function *FN)
                                     if (ArgVal->hasOneUser())
                                     {
                                         // Merge updatetag + checkbound in a function call
-                                        dbg(errs() << "to be merged updatetag :" << *ArgVal << "\n";)
-
-                                        // IRBuilder<> B(cb);
-                                        // Module *mod = cb->getModule();
-                                        // StringRef FnName = "__spp_update_check_clean";
-                                        // if (ArgFnCall->getName().endswith("_direct"))
-                                        //     FnName = "__spp_update_check_clean_direct";
+                                        IRBuilder<> B(cb);
+                                        Module *mod = cb->getModule();
+                                        StringRef FnName = "__spp_update_check_clean";
+                                        if (ArgFnCall->getName().endswith("_direct"))
+                                            FnName = "__spp_update_check_clean_direct";
                                         
-                                        // // create a call with the same type of update tag
-                                        // FunctionType *fty = ArgFnCall->getFunctionType();
-                                        // FunctionCallee hook = mod->getOrInsertFunction(FnName, fty); 
-                                        // vector <Value*> arglist(ArgInst->arg_begin(), ArgInst->arg_end());
-                                        // CallInst *NewCI = B.CreateCall(hook, arglist);                         
-                                        // NewCI->setDoesNotThrow();
-
-                                        // // replace the use of the updated tag
-                                        // ArgInst->replaceAllUsesWith(ArgInst->getOperand(0));
-                                        // // replace the uses of the checked and cleaned value
-                                        // if (!cb->use_empty())
-                                        //     cb->replaceAllUsesWith(NewCI);
+                                        Value* UpdateTagOff = ArgInst->getOperand(1)->stripPointerCasts();
+                                        // for correct calculation:
+                                        // we have to pass updatetag_off + (memintr_off - 1)
+                                        Value *TotalOff = nullptr;
+                                        if ( isa<Constant>(MemIntrOff) && 
+                                             isa<Constant>(UpdateTagOff) )
+                                        {
+                                            dbg(errs() << "In Function: " << FN->getName() << "\n";)
+                                            dbg(errs() << "to be merged updatetag with const offs:" << *ArgVal << "\n";)
+                                            int64_t FirstOff = (cast<ConstantInt>(MemIntrOff))->getSExtValue();
+                                            int64_t SecondOff = (cast<ConstantInt>(UpdateTagOff))->getSExtValue();
+                                            int64_t NewOff = FirstOff + SecondOff - 1;
+                                            TotalOff = ConstantInt::get(Type::getInt64Ty(mod->getContext()), NewOff);
+                                        }
+                                        else
+                                        {
+                                            dbg(errs() << "In Function: " << FN->getName() << "\n";)
+                                            dbg(errs() << "to be merged updatetag with created Add:" << *ArgVal << "\n";)
+                                            Value *NewOff = B.CreateAdd(MemIntrOff, UpdateTagOff);
+                                            Value *One = ConstantInt::get(Type::getInt64Ty(mod->getContext()), 1);
+                                            TotalOff = B.CreateSub(NewOff, One);
+                                        }
                                         
-                                        // // remove both the update tag and the checkbound call
-                                        // redundantChecks.push_back(ArgInst);
-                                        // redundantChecks.push_back(cb);
-                                        // changed = true;
+                                        // create a call with the same type of update tag
+                                        FunctionType *fty = ArgFnCall->getFunctionType();
+                                        FunctionCallee hook = mod->getOrInsertFunction(FnName, fty); 
+                                        vector <Value*> arglist;
+                                        arglist.push_back(ArgInst->getOperand(0));
+                                        arglist.push_back(TotalOff);
+                                        CallInst *NewCI = B.CreateCall(hook, arglist, "spp_upd_memintr.");                         
+                                        NewCI->setDoesNotThrow();
+
+                                        // replace the use of the updated tag
+                                        ArgInst->replaceAllUsesWith(ArgInst->getOperand(0));
+                                        // replace the uses of the checked and cleaned value
+                                        if (!cb->use_empty())
+                                            cb->replaceAllUsesWith(NewCI);
+                                        
+                                        // remove both the update tag and the checkbound call
+                                        redundantChecks.push_back(ArgInst);
+                                        redundantChecks.push_back(cb);
+                                        untaggedPtrs.insert(NewCI);
+                                        changed = true;
                                     }
                                 }
                             }
@@ -2113,6 +2148,13 @@ SPPLTO::runOnModule(Module &M)
         for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
         { 
             mergeTagUpdatesCheckbounds(&*Fn);
+        }
+        postProcessedInst += redundantChecks.size();
+        eraseRedundantChecks();
+
+        for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+        { 
+            mergeTagUpdatesMemChecks(&*Fn);
         }
         postProcessedInst += redundantChecks.size();
         eraseRedundantChecks();
