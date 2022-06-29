@@ -1834,7 +1834,11 @@ SPPLTO::redundantCB(Function *FN)
                                     // ReplaceInstWithInst(cb, NewCI);
                                     dbg(errs() << "added " << *NewCI << " from " << FN->getName() << "\n";)
                                     redundantChecks.push_back(cb);
-                                    pmemPtrs.insert(NewCI);
+                                    
+                                    if (FnName.equals("__spp_updatetag_direct"))
+                                        pmemPtrs.insert(NewCI);
+                                    else
+                                        untaggedPtrs.insert(NewCI);
                                 }
                             }
                             else 
