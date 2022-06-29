@@ -97,6 +97,7 @@ struct SPPLTO : public ModulePass {
   virtual bool duplicateUpdateTags(Function *F);
   virtual bool duplicateCheckBounds(Function *F);
   virtual bool mergeTagUpdates(Function *F);
+  virtual bool mergeTagUpdatesCheckbounds(Function *F);
   virtual bool redundantTagUpdates(Function *F);  
 
   virtual bool trackPtrs (Function * F);
@@ -843,10 +844,10 @@ SPPLTO::trackPtrs(Function* F)
                 //- already cleaned ptr -//
                 else if (CalleeF->getName().contains("__spp_cleantag") ||
                     CalleeF->getName().contains("__spp_memintr_check_and_clean") ||
-                    CalleeF->getName().contains("__spp_checkbound")) 
+                    CalleeF->getName().contains("__spp_checkbound") || 
+                    CalleeF->getName().contains("__spp_update_check_clean")) 
                 {
                     untaggedPtrs.insert(Ins);
-                    dbg(errs()<<"malloc/calloc/realloc/exception ptr: " << *Ins << "\n";)
 
                     std::vector<User*> Users(Ins->user_begin(), Ins->user_end());
                     for (auto User : Users) 
@@ -895,11 +896,13 @@ SPPLTO::trackPtrs(Function* F)
                         }  
                     }
                 }
-                // pmemobj_pool_by_ptr, pmemobj_tx_xadd_range_direct and pmemobj_tx_add_range_direct
+                // pmemobj_pool_by_ptr, pmemobj_tx_xadd_range_direct, pmemobj_tx_add_range_direct
+                // and __spp_update_check_clean_direct
                 // only take PM ptrs as arguments
                 else if ( CalleeF->getName().equals("pmemobj_pool_by_ptr") ||
                         CalleeF->getName().equals("pmemobj_tx_xadd_range_direct") ||
-                        CalleeF->getName().equals("pmemobj_tx_add_range_direct"))
+                        CalleeF->getName().equals("pmemobj_tx_add_range_direct") ||
+                        CalleeF->getName().contains("__spp_update_check_clean_direct"))
                 {
                     Value* PMptr = Ins->getOperand(0);
                     dbg(errs() << ">> LTO pass PM ptr from PMDK funcs: " << *PMptr << " from " << *Ins << "\n";)
@@ -1276,6 +1279,50 @@ SPPLTO::duplicateCheckBounds(Function *FN)
             }
         }
     }
+
+    DenseMap<Value*, DenseMap<Value*, Value*>> updatedVals;
+    for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
+    {
+        for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
+        { 
+            if (auto cb = dyn_cast<CallInst>(ins)) 
+            {
+                Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
+                if (cfn)
+                {
+                    // Check for redundant updatetag calls that are directly cleaned
+                    if (cfn->getName().contains("__spp_update_check_clean"))
+                    {
+                        Value* ArgVal = cb->getOperand(0)->stripPointerCasts();
+                        Value* Off = cb->getOperand(1)->stripPointerCasts();
+                        
+                        if (updatedVals.find(ArgVal) == updatedVals.end()) 
+                        {
+                            updatedVals[ArgVal][Off] = cb;
+                        }
+                        else 
+                        {
+                            if (updatedVals[ArgVal].find(Off) != updatedVals[ArgVal].end())
+                            {
+                                DominatorTree DT = DominatorTree(*FN);
+                                if (!DT.dominates(updatedVals[ArgVal][Off], cb))
+                                {
+                                    dbg(errs() << "Non-dominated __spp_update_check_clean usage" << *cb << "\n";)
+                                }
+                                else
+                                {
+                                    dbg(errs() << FN->getName() << " :there is a duplicate __spp_update_check_clean " << \
+                                                *updatedVals[ArgVal][Off] << "\n";)
+                                    cb->replaceAllUsesWith(updatedVals[ArgVal][Off]);
+                                    redundantChecks.push_back(cb);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     checkedVals.clear();
     return changed;
 }
@@ -1502,7 +1549,6 @@ bool
 SPPLTO::redundantTagUpdates(Function *FN)
 {
     bool changed = false;
-    
     for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
     {
         for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
@@ -1531,6 +1577,7 @@ SPPLTO::redundantTagUpdates(Function *FN)
                                         dbg(errs() << "updated cleantag callback :" << *cb << "\n";)
                                         ArgInst->replaceAllUsesWith(ArgInst->getOperand(0));
                                         redundantChecks.push_back(ArgInst);
+                                        changed = true;
                                     }
                                     else 
                                     {
@@ -1544,48 +1591,128 @@ SPPLTO::redundantTagUpdates(Function *FN)
                 }
             }
         }
+    }    
+    return changed;
+}
+
+bool
+SPPLTO::mergeTagUpdatesCheckbounds(Function *FN)
+{
+    bool changed = false;
+
+    for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
+    {
+        for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
+        { 
+            if (auto cb = dyn_cast<CallInst>(ins)) 
+            {
+                Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
+                if (cfn)
+                {
+                    // Check for redundant updatetag calls that have been performed already
+                    if (cfn->getName().contains("__spp_checkbound"))
+                    {
+                        Value* ArgVal = cb->getOperand(0)->stripPointerCasts();
+                        if (auto ArgInst = dyn_cast<CallInst>(ArgVal))
+                        {
+                            if (auto ArgFnCall = dyn_cast<Function>(ArgInst->getCalledOperand()->stripPointerCasts()))
+                            {
+                                if (ArgFnCall->getName().contains("__spp_updatetag"))
+                                {
+                                    if (ArgVal->hasOneUser())
+                                    {
+                                        // Merge updatetag + checkbound in a function call
+                                        dbg(errs() << "to be merged updatetag :" << *ArgVal << "\n";)
+
+                                        IRBuilder<> B(cb);
+                                        Module *mod = cb->getModule();
+                                        StringRef FnName = "__spp_update_check_clean";
+                                        if (ArgFnCall->getName().endswith("_direct"))
+                                            FnName = "__spp_update_check_clean_direct";
+                                        
+                                        // create a call with the same type of update tag
+                                        FunctionType *fty = ArgFnCall->getFunctionType();
+                                        FunctionCallee hook = mod->getOrInsertFunction(FnName, fty); 
+                                        vector <Value*> arglist(ArgInst->arg_begin(), ArgInst->arg_end());
+                                        CallInst *NewCI = B.CreateCall(hook, arglist);                         
+                                        NewCI->setDoesNotThrow();
+
+                                        // replace the use of the updated tag
+                                        ArgInst->replaceAllUsesWith(ArgInst->getOperand(0));
+                                        // replace the uses of the checked and cleaned value
+                                        if (!cb->use_empty())
+                                            cb->replaceAllUsesWith(NewCI);
+                                        
+                                        // remove both the update tag and the checkbound call
+                                        redundantChecks.push_back(ArgInst);
+                                        redundantChecks.push_back(cb);
+                                        untaggedPtrs.insert(NewCI);
+                                        changed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
+    for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
+    {
+        for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
+        { 
+            if (auto cb = dyn_cast<CallInst>(ins)) 
+            {
+                Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
+                if (cfn)
+                {
+                    // Check for redundant updatetag calls that have been performed already
+                    if (cfn->getName().contains("__spp_memintr_check"))
+                    {
+                        Value* ArgVal = cb->getOperand(0)->stripPointerCasts();
+                        if (auto ArgInst = dyn_cast<CallInst>(ArgVal))
+                        {
+                            if (auto ArgFnCall = dyn_cast<Function>(ArgInst->getCalledOperand()->stripPointerCasts()))
+                            {
+                                if (ArgFnCall->getName().contains("__spp_updatetag"))
+                                {
+                                    if (ArgVal->hasOneUser())
+                                    {
+                                        // Merge updatetag + checkbound in a function call
+                                        dbg(errs() << "to be merged updatetag :" << *ArgVal << "\n";)
 
-    // for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
-    // {
-    //     for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
-    //     { 
-    //         if (auto cb = dyn_cast<CallInst>(ins)) 
-    //         {
-    //             Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
-    //             if (cfn)
-    //             {
-    //                 // Check for redundant updatetag calls that have been performed already
-    //                 if (cfn->getName().contains("__spp_checkbound"))
-    //                 {
-    //                     Value* ArgVal = cb->getOperand(0)->stripPointerCasts();
-    //                     if (auto ArgInst = dyn_cast<CallInst>(ArgVal))
-    //                     {
-    //                         if (auto ArgFnCall = dyn_cast<Function>(ArgInst->getCalledOperand()->stripPointerCasts()))
-    //                         {
-    //                             if (ArgFnCall->getName().contains("__spp_updatetag"))
-    //                             {
-    //                                 if (ArgVal->hasOneUser())
-    //                                 {
-    //                                     // Merge updatetag + checkbound in a function call
-    //                                     errs() << "redundant checkbound :" << *ArgVal << "\n";
-    //                                     errs() << "checkbound callback :" << *cb << "\n";
-    //                                     errs() << "replace operand with " << *ArgInst->getOperand(0) << "\n";
-    //                                     cb->setOperand(0, ArgInst->getOperand(0));
-    //                                     errs() << "updated checkbound callback :" << *cb << "\n";
-    //                                     ArgInst->replaceAllUsesWith(ArgInst->getOperand(0));
-    //                                     redundantChecks.push_back(ArgInst);
-    //                                 }
-    //                             }
-    //                         }
-    //                     }
-                        
-    //                 }
-    //             }
-    //         }
-    //     }
-    // }
+                                        // IRBuilder<> B(cb);
+                                        // Module *mod = cb->getModule();
+                                        // StringRef FnName = "__spp_update_check_clean";
+                                        // if (ArgFnCall->getName().endswith("_direct"))
+                                        //     FnName = "__spp_update_check_clean_direct";
+                                        
+                                        // // create a call with the same type of update tag
+                                        // FunctionType *fty = ArgFnCall->getFunctionType();
+                                        // FunctionCallee hook = mod->getOrInsertFunction(FnName, fty); 
+                                        // vector <Value*> arglist(ArgInst->arg_begin(), ArgInst->arg_end());
+                                        // CallInst *NewCI = B.CreateCall(hook, arglist);                         
+                                        // NewCI->setDoesNotThrow();
 
+                                        // // replace the use of the updated tag
+                                        // ArgInst->replaceAllUsesWith(ArgInst->getOperand(0));
+                                        // // replace the uses of the checked and cleaned value
+                                        // if (!cb->use_empty())
+                                        //     cb->replaceAllUsesWith(NewCI);
+                                        
+                                        // // remove both the update tag and the checkbound call
+                                        // redundantChecks.push_back(ArgInst);
+                                        // redundantChecks.push_back(cb);
+                                        // changed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     return changed;
 }
 
@@ -1606,7 +1733,8 @@ SPPLTO::redundantCB(Function *FN)
                     if (cfn->getName().contains("__spp_checkbound") ||
                         cfn->getName().contains("__spp_updatetag") || 
                         cfn->getName().contains("__spp_cleantag") ||
-                        cfn->getName().contains("__spp_memintr_check_and_clean"))
+                        cfn->getName().contains("__spp_memintr_check_and_clean") ||
+                        cfn->getName().contains("__spp_update_check_clean"))
                     {
                         dbg(errs() << ">>CallBase: "<<*cb<<"\n";)
     
@@ -1692,6 +1820,8 @@ SPPLTO::redundantCB(Function *FN)
                                         FnName = "__spp_cleantag_external_direct";
                                     else if (cfn->getName().equals("__spp_memintr_check_and_clean"))
                                         FnName = "__spp_memintr_check_and_clean_direct";
+                                    else if (cfn->getName().equals("__spp_update_check_clean"))
+                                        FnName = "__spp_update_check_clean_direct";
                                     
                                     FunctionType *fty = cfn->getFunctionType();
                                     FunctionCallee hook = mod->getOrInsertFunction(FnName, fty); 
@@ -1914,7 +2044,7 @@ SPPLTO::runOnModule(Module &M)
         {
             dbg(errs() << ">>Memory func: skipping..\n";)
             continue;
-        } 
+        }
 
         runOnFunction(&*Fn, M);
     }
@@ -1972,6 +2102,13 @@ SPPLTO::runOnModule(Module &M)
         for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
         { 
             duplicateCheckBounds(&*Fn);
+        }
+        postProcessedInst += redundantChecks.size();
+        eraseRedundantChecks();
+
+        for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+        { 
+            mergeTagUpdatesCheckbounds(&*Fn);
         }
         postProcessedInst += redundantChecks.size();
         eraseRedundantChecks();
