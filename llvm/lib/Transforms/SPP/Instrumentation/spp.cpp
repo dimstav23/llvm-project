@@ -979,9 +979,11 @@ namespace {
             }
 
             Type *RetArgTy = Type::getInt8PtrTy(M->getContext());
-            SmallVector <Type*, 1> tlist;
+            Type *Arg2Ty = Type::getInt64Ty(M->getContext());
+            SmallVector <Type*, 2> tlist;
             tlist.push_back(RetArgTy);
-            FunctionType *hookfty = FunctionType::get(RetArgTy, RetArgTy, false);
+            tlist.push_back(Arg2Ty);
+            FunctionType *hookfty = FunctionType::get(RetArgTy, tlist, false);
             FunctionCallee hook;
 
             if (pmemPtrs.find(Ptr->stripPointerCasts()) != pmemPtrs.end())
@@ -995,7 +997,19 @@ namespace {
             }
 
             Value *TmpPtr = B.CreateBitCast(Ptr, hook.getFunctionType()->getParamType(0));
-            CallInst *Masked = B.CreateCall(hook, TmpPtr);
+
+            Type *Ty = isa<LoadInst>(I) ? I->getType() :
+                       cast<StoreInst>(I)->getValueOperand()->getType();
+            assert(Ty->isSized());
+            int64_t Size = DL->getTypeStoreSize(Ty);
+            int64_t SizeAligned = Size - 1; // apply -1 for the dereference
+            Value *DerefOff = ConstantInt::get(Type::getInt64Ty(M->getContext()), SizeAligned);
+            
+            std::vector<Value*> args;
+            args.push_back(TmpPtr);
+            args.push_back(DerefOff);
+            
+            CallInst *Masked = B.CreateCall(hook, args);
             Masked->setDoesNotThrow();
             Value *NewPtr = B.CreatePointerCast(Masked, Ptr->getType());
 
@@ -1008,7 +1022,6 @@ namespace {
 
             //replace subsequent uses of the same ptr in ld/st/atomic instructions
             checkedPtrs.insert(NewPtr);
-            // checkedPtrs.insert(Ptr);
 
             /* replace these */
             DenseMap<Instruction*, int> replaceChecked;
@@ -1112,10 +1125,13 @@ namespace {
             }
 
             Type *RetArgTy = Type::getInt8PtrTy(M->getContext());
-            SmallVector <Type*, 1> tlist;
+            Type *Arg2Ty = Type::getInt64Ty(M->getContext());
+            SmallVector <Type*, 2> tlist;
             tlist.push_back(RetArgTy);
-            FunctionType *hookfty = FunctionType::get(RetArgTy, RetArgTy, false);
+            tlist.push_back(Arg2Ty);
+            FunctionType *hookfty = FunctionType::get(RetArgTy, tlist, false);
             FunctionCallee hook;
+
             if (pmemPtrs.find(Ptr->stripPointerCasts()) != pmemPtrs.end())
             {
                 errs() << "__spp_checkbound_direct\n";
@@ -1127,7 +1143,19 @@ namespace {
             }
 
             Value *TmpPtr = B.CreateBitCast(Ptr, hook.getFunctionType()->getParamType(0));
-            CallInst *Masked = B.CreateCall(hook, TmpPtr);
+
+            Type *Ty = isa<LoadInst>(I) ? I->getType() :
+                       cast<StoreInst>(I)->getValueOperand()->getType();
+            assert(Ty->isSized());
+            int64_t Size = DL->getTypeStoreSize(Ty);
+            int64_t SizeAligned = Size - 1; // apply -1 for the dereference
+            Value *DerefOff = ConstantInt::get(Type::getInt64Ty(M->getContext()), SizeAligned);
+
+            std::vector<Value*> args;
+            args.push_back(TmpPtr);
+            args.push_back(DerefOff);
+
+            CallInst *Masked = B.CreateCall(hook, args);
             Masked->setDoesNotThrow();
             Value *NewPtr = B.CreatePointerCast(Masked, Ptr->getType());
             
@@ -1623,7 +1651,7 @@ namespace {
                 BasicBlock *BB = &*BI; 
                 Instruction *sucInst = &*(BB->begin());
 
-                preemptBoundsCheck(BB);
+                // preemptBoundsCheck(BB);
 
                 for (auto II = BB->begin(); II != BB->end(); ++II) 
                 {    

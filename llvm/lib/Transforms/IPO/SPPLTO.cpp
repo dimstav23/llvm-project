@@ -115,6 +115,7 @@ struct SPPLTO : public ModulePass {
     //AU.addRequired<DominatorTreeWrapperPass>();
     //AU.addRequired<AAResultsWrapperPass>();
     //AU.addRequired<CallGraphWrapperPass>();
+    AU.addRequired<ScalarEvolutionWrapperPass>();
     AU.addRequired<TargetLibraryInfoWrapperPass>();
   }
 
@@ -127,6 +128,18 @@ struct SPPLTO : public ModulePass {
   TargetLibraryInfo *getTLI(const Function & F)
   {
     return &this->TLIWP->getTLI(F);
+  }
+
+  ScalarEvolution* SE = nullptr;
+  void setScalarEvolution(ScalarEvolution *SE) 
+  {
+    this->SE = SE;
+  }
+  
+  const DataLayout *DL = nullptr;
+  void setDL(const DataLayout *DL) 
+  {
+    this->DL = DL;
   }
 
   protected:
@@ -143,6 +156,8 @@ static std::unordered_set <Value*> vtPtrs;
 static std::vector<Instruction*> redundantChecks;
 DenseMap<Value*, SPPLTO::operandType> FnArgType;
 DenseMap<Value*, Function*> FnArgFun;
+
+int isFirstLTO = 1;
 
 char SPPLTO::ID = 0;
 
@@ -1237,11 +1252,14 @@ SPPLTO::duplicateUpdateTags(Function *FN)
     return changed;
 }
 
+/*
+ * Remove duplicate checkbound calls
+ */
 bool
 SPPLTO::duplicateCheckBounds(Function *FN)
 {
     bool changed = false;
-    DenseMap<Value*, Value*> checkedVals;
+    DenseMap<Value*, DenseMap<Value*, Value*>> checkedVals;
     for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
     {
         for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
@@ -1255,24 +1273,29 @@ SPPLTO::duplicateCheckBounds(Function *FN)
                     if (cfn->getName().contains("__spp_checkbound"))
                     {
                         Value* ArgVal = cb->getOperand(0)->stripPointerCasts();
+                        Value* DerefOff = cb->getOperand(1)->stripPointerCasts();
+
                         if (checkedVals.find(ArgVal) == checkedVals.end()) 
                         {
-                            checkedVals[ArgVal] = cb;
-                            dbg(errs() << *cb << " op : " << *ArgVal << "\n";)  
+                            checkedVals[ArgVal][DerefOff] = cb;
+                            dbg(errs() << *cb << " op : " << *ArgVal << " deref : " << DerefOff << "\n";)  
                         }
                         else 
                         {
-                            DominatorTree DT = DominatorTree(*FN);
-                            if (!DT.dominates(checkedVals[ArgVal], cb))
+                            if (checkedVals[ArgVal].find(DerefOff) != checkedVals[ArgVal].end())
                             {
-                                dbg(errs() << "Non-dominated checkbound usage" << *cb << "\n";)
-                            }
-                            else
-                            {
-                                dbg(errs() << *cb << " duplicate checkbound : " << *ArgVal << "\n";)
-                                dbg(errs() << "should be replaced with: " << *checkedVals[ArgVal] << "\n";)
-                                cb->replaceAllUsesWith(checkedVals[ArgVal]);
-                                redundantChecks.push_back(cb);
+                                DominatorTree DT = DominatorTree(*FN);
+                                if (!DT.dominates(checkedVals[ArgVal][DerefOff], cb))
+                                {
+                                    dbg(errs() << "Non-dominated checkbound usage" << *cb << "\n";)
+                                }
+                                else
+                                {
+                                    dbg(errs() << *cb << " duplicate checkbound : " << *ArgVal << "\n";)
+                                    dbg(errs() << "should be replaced with: " << *checkedVals[ArgVal][DerefOff] << "\n";)
+                                    cb->replaceAllUsesWith(checkedVals[ArgVal][DerefOff]);
+                                    redundantChecks.push_back(cb);
+                                }
                             }
                         }
                     }
@@ -1328,6 +1351,9 @@ SPPLTO::duplicateCheckBounds(Function *FN)
     return changed;
 }
 
+/*
+ * Merge consecutive tag updates into a single one
+ */
 bool
 SPPLTO::mergeTagUpdates(Function *FN)
 {
@@ -1492,6 +1518,9 @@ SPPLTO::mergeTagUpdates(Function *FN)
     return changed;
 }
 
+/*
+ * Remove duplicate tag updates
+ */
 bool
 SPPLTO::duplicateTagUpdates(Function *FN)
 {
@@ -1546,6 +1575,9 @@ SPPLTO::duplicateTagUpdates(Function *FN)
     return changed;
 }
 
+/*
+ * Remove redundant tag updates, e.g., when directly cleaned
+ */
 bool
 SPPLTO::redundantTagUpdates(Function *FN)
 {
@@ -1596,6 +1628,9 @@ SPPLTO::redundantTagUpdates(Function *FN)
     return changed;
 }
 
+/*
+ * Merge some occasions of tag update and immediate checkbound
+ */
 bool
 SPPLTO::mergeTagUpdatesCheckbounds(Function *FN)
 {
@@ -1610,10 +1645,11 @@ SPPLTO::mergeTagUpdatesCheckbounds(Function *FN)
                 Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
                 if (cfn)
                 {
-                    // Check for redundant updatetag calls that have been performed already
                     if (cfn->getName().contains("__spp_checkbound"))
                     {
                         Value* ArgVal = cb->getOperand(0)->stripPointerCasts();
+                        Value* DerefOff = cb->getOperand(1)->stripPointerCasts();
+                        
                         if (auto ArgInst = dyn_cast<CallInst>(ArgVal))
                         {
                             if (auto ArgFnCall = dyn_cast<Function>(ArgInst->getCalledOperand()->stripPointerCasts()))
@@ -1634,12 +1670,46 @@ SPPLTO::mergeTagUpdatesCheckbounds(Function *FN)
                                         // create a call with the same type of update tag
                                         FunctionType *fty = ArgFnCall->getFunctionType();
                                         FunctionCallee hook = mod->getOrInsertFunction(FnName, fty); 
-                                        vector <Value*> arglist(ArgInst->arg_begin(), ArgInst->arg_end());
+
+                                        // get the ptr operand of update tag call
+                                        Value* Ptr = ArgInst->getArgOperand(0); 
+                                        Value *TotalOff;
+                                        // get the offset of update tag call
+                                        if (auto *CI = dyn_cast<ConstantInt>(ArgInst->getArgOperand(1)->stripPointerCasts()))
+                                        {
+                                            // if update has a constant offset simply add the integers
+                                            int64_t UpdOff = CI->getSExtValue(); 
+                                            // get the dereference size
+                                            int64_t CheckOff = (cast<ConstantInt>(DerefOff))->getSExtValue(); 
+                                            // accummulate the offset and the dereferenced type size
+                                            int64_t NewOff = UpdOff + CheckOff; 
+
+                                            TotalOff = ConstantInt::get(Type::getInt64Ty(mod->getContext()), NewOff);
+                                            dbg(errs()<<"updated off " << NewOff << " " << UpdOff << "+" << CheckOff <<"\n";)
+                                        }
+                                        else
+                                        {
+                                            // if update tag has a variable offset create an ADD
+                                            Value* UpdOff = ArgInst->getArgOperand(1)->stripPointerCasts();
+                                            // get the dereference size
+                                            Value* CheckOff = DerefOff;
+                                            // accummulate the offset and the dereferenced type size
+                                            Value* NewOff = B.CreateAdd(UpdOff, CheckOff);
+                                            
+                                            TotalOff = NewOff;
+
+                                            dbg(errs()<<"updated off " << *NewOff << " " << *UpdOff << "+" << *CheckOff <<"\n";)
+                                        }
+                                        
+                                        vector <Value*> arglist;
+                                        arglist.push_back(Ptr);
+                                        arglist.push_back(TotalOff);
+
                                         CallInst *NewCI = B.CreateCall(hook, arglist, "spp_upd_cb.");                         
                                         NewCI->setDoesNotThrow();
 
-                                        // replace the use of the updated tag
-                                        ArgInst->replaceAllUsesWith(ArgInst->getOperand(0));
+                                        // replace the use of the updated tag with the initial ptr
+                                        ArgInst->replaceAllUsesWith(ArgInst->getArgOperand(0));
                                         // replace the uses of the checked and cleaned value
                                         if (!cb->use_empty())
                                             cb->replaceAllUsesWith(NewCI);
@@ -1958,6 +2028,21 @@ SPPLTO::redundantCB(Function *FN)
     return changed;
 }
 
+static void insertPrint(BasicBlock *BB, Instruction *I, StringRef S) {
+  Module *M = BB->getModule();
+  LLVMContext &Ctx = M->getContext();
+  auto *CharPointerTy = PointerType::get(IntegerType::getInt8Ty(Ctx), 0);
+  auto *PrintfTy =
+      FunctionType::get(IntegerType::getVoidTy(Ctx), {CharPointerTy}, true);
+  auto Printf = M->getOrInsertFunction("__spp_update_checkcnt", PrintfTy);
+  auto Arr = ConstantDataArray::getString(Ctx, S);
+  GlobalVariable *GV = new GlobalVariable(
+      *M, Arr->getType(), true, GlobalValue::PrivateLinkage, Arr, ".str");
+  GV->setAlignment(MaybeAlign(1));
+  CallInst::Create(Printf, {ConstantExpr::getBitCast(GV, CharPointerTy)}, "",
+                   I);
+}
+
 bool
 SPPLTO::runOnFunction(Function *FN, Module &M)
 {
@@ -2003,6 +2088,7 @@ SPPLTO::runOnModule(Module &M)
         // return false; /// DON'T DELETE ME!!
     }
     
+    setDL(&M.getDataLayout()); //init the data layout
     setTLIWP(&getAnalysis<TargetLibraryInfoWrapperPass>());
 
     //Track global ptrs
@@ -2162,28 +2248,69 @@ SPPLTO::runOnModule(Module &M)
         dbg(errs() << "post processed inst: " << postProcessedInst << "\n";)
     } while(postProcessedInst!=0);
 
-    // for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
-    // { 
-    //     int cnt = 0;
-    //     for (auto BB = Fn->begin(); BB != Fn->end(); ++BB) 
-    //     {
-    //         for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
+    // if (!isFirstLTO)
+    // {
+    //     for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+    //     { 
+    //         int cnt = 0;
+    //         for (auto BB = Fn->begin(); BB != Fn->end(); ++BB) 
     //         {
-    //             if (auto cb = dyn_cast<CallBase>(ins)) 
+    //             for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
     //             {
-    //                 Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
-    //                 if (cfn) 
+    //                 if (auto cb = dyn_cast<CallBase>(ins)) 
     //                 {
-    //                     StringRef fname = cfn->getName();
-    //                     if (fname.contains("__spp_memintr_check_and_clean"))
-    //                         cnt++;
+    //                     Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
+    //                     if (cfn) 
+    //                     {
+    //                         StringRef fname = cfn->getName();
+    //                         if (fname.contains("__spp_checkbound") ||
+    //                             fname.contains("__spp_update_check"))
+    //                             cnt++;
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //         errs() << Fn->getName() << " checkbounds : " << cnt << "\n";
+    //     }
+    // }
+
+    // if (!isFirstLTO)
+    // {
+    //     int check_idx=1;
+    //     for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
+    //     { 
+    //         for (auto BB = Fn->begin(); BB != Fn->end(); ++BB) 
+    //         {
+    //             BasicBlock *BaB = &*BB;
+    //             for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
+    //             {
+    //                 if (auto cb = dyn_cast<CallBase>(ins)) 
+    //                 {
+    //                     Function* CalleeF = cb->getCalledFunction();
+    //                     if (CalleeF) 
+    //                     {
+    //                         StringRef fname = CalleeF->getName();
+    //                         if (fname.contains("__spp_checkbound"))
+    //                         {
+    //                             // StringRef S = StringRef((Fn->getName()+"_"+Twine(check_idx)).str());
+    //                             StringRef S = StringRef(std::to_string(check_idx));
+    //                             insertPrint(BaB, cb, S);
+    //                             check_idx++;
+    //                         }
+    //                         else if (fname.contains("__spp_update_check_clean"))
+    //                         {
+    //                             // StringRef S = StringRef((Fn->getName()+"_"+Twine(check_idx)).str());
+    //                             StringRef S = StringRef(std::to_string(check_idx));
+    //                             insertPrint(BaB, cb, S);
+    //                             check_idx++;
+    //                         }
+    //                     }
     //                 }
     //             }
     //         }
     //     }
-    //     errs() << Fn->getName() << " memintr_checks : " << cnt << "\n";
     // }
-
+    
     // for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
     // {
     //     for (auto BB = Fn->begin(); BB != Fn->end(); ++BB) 
@@ -2195,11 +2322,12 @@ SPPLTO::runOnModule(Module &M)
     //     }
     // }
 
-    dbg(errs() << M << "\n";)
-    
+    // if (!isFirstLTO)
+    //     errs() << M << "\n";
+
     memCleanUp();
 
     errs() << ">>Leaving SPPLTO\n";
-
+    isFirstLTO=0;
     return true;
 }
