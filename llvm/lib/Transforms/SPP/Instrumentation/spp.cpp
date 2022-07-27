@@ -1482,6 +1482,32 @@ namespace {
             return true;
         }
 
+        static int64_t findMaxDerefSize(Instruction *I, const DataLayout *DL) {
+            int64_t MaxDerefSize = 0;
+            for (User *U : I->users()) {
+                Type *Ty;
+                if (auto *SI = dyn_cast<StoreInst>(U)) {
+                    if (!(SI->getValueOperand() == I))
+                    {
+                        Ty = cast<StoreInst>(U)->getValueOperand()->getType();
+                    }
+                }
+                else if (isa<LoadInst>(U)) {
+                    Ty = U->getType();
+                }
+                else
+                {
+                    continue;
+                }
+                
+                int64_t Size = DL->getTypeStoreSize(Ty);
+
+                if (Size > MaxDerefSize)
+                    MaxDerefSize = Size;
+            }
+            return MaxDerefSize;
+        }
+
         static unsigned firstDeref(const Instruction *Ptr) {
             int Idx = 0;
             for (const Instruction &I : *Ptr->getParent()) {
@@ -1503,6 +1529,7 @@ namespace {
         bool preemptBoundsCheck(BasicBlock* BB) {
             bool changed = false;
             DenseMap<Value*, SmallVector<GetElementPtrInst*, 4>> InternalGEPs;
+            DenseMap<GetElementPtrInst*, int64_t> DerefOffGEPs;
 
             for (auto II = BB->begin(); II != BB->end(); ++II) {
                 Instruction *I= &*II;
@@ -1526,11 +1553,14 @@ namespace {
                         dbg(errs() << __func__<< ">>vtable ptr skipped GEP preemption: " << *Gep << "\n";)
                         continue;
                     }                
-                    if (Gep->hasAllConstantIndices())
+                    if (Gep->hasAllConstantIndices()) //TODO: sophisticated method for the complex ones
                     {
                         if (isOnlyUsedAndDereferencedInBlock(Gep, BB))
                         {
+                            int64_t MaxDerefSize = findMaxDerefSize(Gep, DL);
                             InternalGEPs.FindAndConstruct(Gep->getPointerOperand()).second.push_back(Gep);
+                            DerefOffGEPs[Gep] = MaxDerefSize;
+                            dbg(errs() << "Max Deref Size : " << MaxDerefSize << " for " << *Gep << "\n";)
                         }
                     }
                 }
@@ -1544,8 +1574,12 @@ namespace {
                 // Only consider each base pointer that have multiple uses in the block
                 if (GEPs.size() < 2)
                     continue;
-                else
+                else 
+                {
                     dbg(errs() << "there is a chance for preemption in:\n" << BB->getParent()->getName() << *BB << "\n";)
+                    dbg(errs() << "number of geps: " << GEPs.size() << "\n";)
+                    dbg(errs() << "first examined gep : " << *GEPs[0] << "\n";)
+                }
                 
                 // Set the insert point before sorting to make sure the masked base
                 // will dominate all uses 
@@ -1559,22 +1593,29 @@ namespace {
                             return firstDeref(A) < firstDeref(B);
                         });
 
-                // Find the maximum offset
+                // // Find the maximum offset
                 unsigned PointerBits=64;
                 GetElementPtrInst *MaxOffsetGEP = GEPs[0]; // GEP command
-                APInt MaxOffset(PointerBits, 0); // init max off to 0
-                GEPs[0]->accumulateConstantOffset(*DL, MaxOffset);
+                APInt Offset(PointerBits, 0); // init max off to 0
+                GEPs[0]->accumulateConstantOffset(*DL, Offset); // get the gep offset
+                APInt MaxDerefSize(PointerBits, DerefOffGEPs[GEPs[0]]); // get the maximum dereference size to add to the tag
+                APInt MaxOffset = Offset + MaxDerefSize;
 
                 for (unsigned i = 1, n = GEPs.size(); i < n; ++i) {
                     APInt Offset(PointerBits, 0);
                     GEPs[i]->accumulateConstantOffset(*DL, Offset);
+                    APInt MaxDerefSize(PointerBits, DerefOffGEPs[GEPs[i]]);
+                    Offset += MaxDerefSize;
                     if (Offset.sgt(MaxOffset)) {
                         MaxOffset = Offset;
                         MaxOffsetGEP = GEPs[i];
                     }
                 }
+                // Max Offset also contains the maximum dereference size of this GEP
                 dbg(errs() << "MaxOffset : " << MaxOffset << " in " << *MaxOffsetGEP << "\n";)
                 dbg(errs() << "Initial BB:\n" << *BB << "\n";)
+                APInt UpdateTagOff = MaxOffset - DerefOffGEPs[MaxOffsetGEP];
+
                 /* 
                  * update the tag once and 
                  * propagate the output to the spotted GEPs
@@ -1586,7 +1627,7 @@ namespace {
                 tlist.push_back(Arg2Ty);
                 
                 FunctionType *hookfty = FunctionType::get(RetArgTy, tlist, false);
-                FunctionCallee hook;           
+                FunctionCallee hook;
                 if (pmemPtrs.find(MaxOffsetGEP->getPointerOperand()->stripPointerCasts()) != pmemPtrs.end())
                 {
                     dbg(errs() << "__spp_updatetag_direct\n";)
@@ -1598,7 +1639,7 @@ namespace {
                 }
 
                 Value *TmpPtr = B.CreateBitCast(MaxOffsetGEP->getPointerOperand(), hook.getFunctionType()->getParamType(0));
-                Value *IntOff = ConstantInt::get(hook.getFunctionType()->getParamType(1), MaxOffset);
+                Value *IntOff = ConstantInt::get(hook.getFunctionType()->getParamType(1), UpdateTagOff);
                 
                 std::vector<Value*> args;
                 args.push_back(TmpPtr);
@@ -1611,8 +1652,7 @@ namespace {
                  * insert checkbound call for the max bound
                  * and propagate the clean ptr to the ld/st
                  */
-                tlist.clear();
-                tlist.push_back(RetArgTy);
+                //preserve the tlist same as the previous call
                 hookfty = FunctionType::get(RetArgTy, tlist, false);
 
                 if (pmemPtrs.find(MaxOffsetGEP->getPointerOperand()->stripPointerCasts()) != pmemPtrs.end())
@@ -1625,7 +1665,12 @@ namespace {
                     hook = M->getOrInsertFunction("__spp_checkbound", hookfty);
                 }
 
-                CallInst *Masked = B.CreateCall(hook, TagUpdated); //cleaned and checked ptr for the max offset
+                args.clear();
+                args.push_back(TagUpdated);
+                Value *CheckboundOff = ConstantInt::get(hook.getFunctionType()->getParamType(1), DerefOffGEPs[MaxOffsetGEP]-1);// -1 for the dereference
+                args.push_back(CheckboundOff);
+
+                CallInst *Masked = B.CreateCall(hook, args); //cleaned and checked ptr for the max offset
                 Masked->setDoesNotThrow();
                 Value *UpdatedPtr = B.CreatePointerCast(Masked, MaxOffsetGEP->getPointerOperand()->getType());  
 
@@ -1638,7 +1683,6 @@ namespace {
                 dbg(errs() << "New BB:\n" << *BB << "\n";)
             }
             
-
             return changed;
         }
 
@@ -1651,7 +1695,7 @@ namespace {
                 BasicBlock *BB = &*BI; 
                 Instruction *sucInst = &*(BB->begin());
 
-                // preemptBoundsCheck(BB);
+                preemptBoundsCheck(BB);
 
                 for (auto II = BB->begin(); II != BB->end(); ++II) 
                 {    
