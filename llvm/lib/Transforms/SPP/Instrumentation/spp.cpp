@@ -1909,11 +1909,12 @@ namespace {
                                 }  
                             }
                         }
-                        // pmemobj_pool_by_ptr, pmemobj_tx_xadd_range_direct and pmemobj_tx_add_range_direct
+                        // pmemobj_oid, pmemobj_pool_by_ptr, pmemobj_tx_xadd_range_direct and pmemobj_tx_add_range_direct
                         // only take PM ptrs as arguments
                         else if ( CalleeF->getName().equals("pmemobj_pool_by_ptr") ||
                                 CalleeF->getName().equals("pmemobj_tx_xadd_range_direct") ||
-                                CalleeF->getName().equals("pmemobj_tx_add_range_direct"))
+                                CalleeF->getName().equals("pmemobj_tx_add_range_direct") ||
+                                CalleeF->getName().equals("pmemobj_oid"))
                         {
                             Value* PMptr = Ins->getOperand(0);
                             dbg(errs() << ">> SPP pass PM ptr from PMDK funcs: " << *PMptr << " from " << *Ins << "\n";)
@@ -2225,10 +2226,10 @@ namespace {
                     continue; 
                 }
 
-                if (F->getName().contains("pmemobj_direct"))
-                    // F->getName().contains("pmemobj_oid"))
+                if (F->getName().contains("pmemobj_direct") ||
+                    F->getName().contains("pmemobj_oid"))
                 {
-                    dbg(errs() << "pmempobj direct func.. skipping\n";)
+                    dbg(errs() << "pmempobj direct/oid func.. skipping\n";)
                     continue; 
                 }
 

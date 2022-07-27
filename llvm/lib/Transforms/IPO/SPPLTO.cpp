@@ -294,15 +294,19 @@ doCallExternal(CallBase *CB)
 {
     bool changed = false;
 
-    // Skip tag cleaning for certain transaction functions
+    // Skip tag cleaning for certain snapshotting functions, thread functions and pmemobj_oid function
     if (CB->getCalledFunction() != NULL &&
         (CB->getCalledFunction()->getName().contains("pmemobj_tx_add_range_direct") || 
+         CB->getCalledFunction()->getName().contains("pmemobj_tx_xadd_range_direct") || 
+         CB->getCalledFunction()->getName().contains("pmemobj_oid") ||
          CB->getCalledFunction()->getName().equals("pthread_create") ||
          CB->getCalledFunction()->getName().equals("pthread_cond_signal")))
     {
         return changed;
     }
 
+    // if it's not a call to any of the below functions
+    // the ptr is untagged
     if (CB->getCalledFunction() != NULL &&
         !CB->getCalledFunction()->getName().contains("pmemobj_direct") &&
         !(StringRef(CB->getCalledFunction()->getName()).startswith("pmem::obj::persistent_ptr") && 
@@ -912,10 +916,11 @@ SPPLTO::trackPtrs(Function* F)
                         }  
                     }
                 }
-                // pmemobj_pool_by_ptr, pmemobj_tx_xadd_range_direct, pmemobj_tx_add_range_direct
+                // pmemobj_oid, pmemobj_pool_by_ptr, pmemobj_tx_xadd_range_direct, pmemobj_tx_add_range_direct
                 // and __spp_update_check_clean_direct
                 // only take PM ptrs as arguments
                 else if ( CalleeF->getName().equals("pmemobj_pool_by_ptr") ||
+                        CalleeF->getName().equals("pmemobj_oid") ||
                         CalleeF->getName().equals("pmemobj_tx_xadd_range_direct") ||
                         CalleeF->getName().equals("pmemobj_tx_add_range_direct") ||
                         CalleeF->getName().contains("__spp_update_check_clean_direct"))
