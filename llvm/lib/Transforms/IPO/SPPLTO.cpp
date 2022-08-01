@@ -474,7 +474,8 @@ SPPLTO::doCallBase(CallBase *cb)
             return changed; 
         }        
         // if it's memory or string function, do not do anything
-        if (isMemFuncName(fname) || isStringFuncName(fname)) 
+        if (isMemFuncName(fname) || isPMemFuncName(fname) ||
+            isStringFuncName(fname)) 
         {
             dbg(errs() << ">>memory or string fn call: skipping..\n";)
             return changed;
@@ -2173,6 +2174,11 @@ SPPLTO::runOnModule(Module &M)
         if (isMemFuncName(Fn->getName())) 
         {
             dbg(errs() << ">>Memory func: skipping..\n";)
+            continue;
+        }
+        if (isPMemFuncName(Fn->getName())) 
+        {
+            dbg(errs() << ">>Persistent Memory func: skipping..\n";)
             continue;
         }
 

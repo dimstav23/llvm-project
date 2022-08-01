@@ -1077,7 +1077,7 @@ namespace {
             
             assert(Ptr->getType()->isPointerTy()); 
             
-            dbg(errs() << ">>"__func__ << "Ptr: " << *Ptr << " stripped: " \
+            dbg(errs() << ">>" << __func__ << "Ptr: " << *Ptr << " stripped: " \
                         << *Ptr->stripPointerCasts() << "\n";)
             
             if (isa<GetElementPtrInst>(Ptr->stripPointerCasts())) 
@@ -1131,10 +1131,10 @@ namespace {
             tlist.push_back(Arg2Ty);
             FunctionType *hookfty = FunctionType::get(RetArgTy, tlist, false);
             FunctionCallee hook;
-
+            
             if (pmemPtrs.find(Ptr->stripPointerCasts()) != pmemPtrs.end())
             {
-                errs() << "__spp_checkbound_direct\n";
+                dbg(errs() << "__spp_checkbound_direct\n";)
                 hook = M->getOrInsertFunction("__spp_checkbound_direct", hookfty);
             }
             else 
@@ -1144,13 +1144,11 @@ namespace {
 
             Value *TmpPtr = B.CreateBitCast(Ptr, hook.getFunctionType()->getParamType(0));
 
-            Type *Ty = isa<LoadInst>(I) ? I->getType() :
-                       cast<StoreInst>(I)->getValueOperand()->getType();
+            Type *Ty = cast<AtomicRMWInst>(I)->getPointerOperand()->getType();
             assert(Ty->isSized());
             int64_t Size = DL->getTypeStoreSize(Ty);
             int64_t SizeAligned = Size - 1; // apply -1 for the dereference
             Value *DerefOff = ConstantInt::get(Type::getInt64Ty(M->getContext()), SizeAligned);
-
             std::vector<Value*> args;
             args.push_back(TmpPtr);
             args.push_back(DerefOff);
@@ -2223,6 +2221,12 @@ namespace {
                 if (isSPPFuncName(F->getName()))
                 {
                     dbg(errs() << "SPP hook func.. skipping\n";)
+                    continue; 
+                }
+
+                if (isPMemFuncName(F->getName()))
+                {
+                    dbg(errs() << "PMEM func.. skipping\n";)
                     continue; 
                 }
 
