@@ -1939,6 +1939,75 @@ namespace {
                                 trackOrigins.erase(trackOrigins.begin());
                             }
                         }
+                        // libpmem pm management functions have their dest argument as a PM ptr
+                        else if (CalleeF->getName().equals("pmem_memmove_persist") ||
+                                CalleeF->getName().equals("pmem_memcpy_persist") ||
+                                CalleeF->getName().equals("pmem_memmove_nodrain") ||
+                                CalleeF->getName().equals("pmem_memmove") ||
+                                CalleeF->getName().equals("pmem_memcpy") ||
+                                CalleeF->getName().equals("pmem_memset_nodrain") ||
+                                CalleeF->getName().equals("pmem_memset") ||
+                                CalleeF->getName().equals("pmem_memset_persist"))
+
+                        {
+                            Value* PMptr = Ins->getOperand(0);
+                            dbg(errs() << ">> SPP pass PM ptr from PMDK funcs: " << *PMptr << " from " << *Ins << "\n";)
+                            std::vector <Value*> trackOrigins;
+                            trackOrigins.push_back(PMptr);
+
+                            while (!trackOrigins.empty())
+                            {                                
+                                Value* curr = trackOrigins.front();
+                                if (Instruction *iUser = dyn_cast<Instruction>(curr))
+                                {
+                                    switch (iUser->getOpcode()) 
+                                    {
+                                        case Instruction::BitCast:
+                                        case Instruction::GetElementPtr:
+                                            dbg(errs() << ">> SPP pass PM ptr from PMDK funcs:" << *iUser->getOperand(0) << "\n";)
+                                            pmemPtrs.insert(iUser->getOperand(0));
+                                            setSPPprefix(iUser->getOperand(0));
+                                            trackOrigins.push_back(iUser->getOperand(0));
+                                        default:
+                                            break;
+                                    }
+                                }
+                                trackOrigins.erase(trackOrigins.begin());
+                            }
+                        }
+                        // libpmemobj pm management functions have their dest argument as a PM ptr
+                        else if (CalleeF->getName().equals("pmemobj_memcpy") ||
+                                CalleeF->getName().equals("pmemobj_memcpy_persist") ||
+                                CalleeF->getName().equals("pmemobj_memmove") ||
+                                CalleeF->getName().equals("pmemobj_memset") ||
+                                CalleeF->getName().equals("pmemobj_memset_persist"))
+
+                        {
+                            Value* PMptr = Ins->getOperand(1);
+                            dbg(errs() << ">> SPP pass PM ptr from PMDK funcs: " << *PMptr << " from " << *Ins << "\n";)
+                            std::vector <Value*> trackOrigins;
+                            trackOrigins.push_back(PMptr);
+
+                            while (!trackOrigins.empty())
+                            {                                
+                                Value* curr = trackOrigins.front();
+                                if (Instruction *iUser = dyn_cast<Instruction>(curr))
+                                {
+                                    switch (iUser->getOpcode()) 
+                                    {
+                                        case Instruction::BitCast:
+                                        case Instruction::GetElementPtr:
+                                            dbg(errs() << ">> SPP pass PM ptr from PMDK funcs:" << *iUser->getOperand(0) << "\n";)
+                                            pmemPtrs.insert(iUser->getOperand(0));
+                                            setSPPprefix(iUser->getOperand(0));
+                                            trackOrigins.push_back(iUser->getOperand(0));
+                                        default:
+                                            break;
+                                    }
+                                }
+                                trackOrigins.erase(trackOrigins.begin());
+                            }
+                        }
                     }
                     /* vtable,vbase and vfn variables */
                     else if (Ins->getName().startswith("vbase.offset") ||
