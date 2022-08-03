@@ -278,7 +278,7 @@ namespace {
         {
             Function *F = userI->getFunction();
             bool found = false;
-
+            dbg(errs() << *Op << " " << *userI << "\n";)
             for (auto & Iter : instructions(F)) 
             {                
                 if (&Iter == userI) 
@@ -320,7 +320,9 @@ namespace {
                 return false;
             }
             
-            if (gep->hasAllZeroIndices()) 
+            if (gep->hasAllZeroIndices() || 
+                isa<Constant>(gep) ||
+                isa<Constant>(gep->getPointerOperand()->stripPointerCasts()))
             {
                return false;
             }
@@ -375,13 +377,12 @@ namespace {
                 dbg(errs() << ">>" << __func__ << " folded op: " << **Op << "\n";) 
                 
                 // only one-depth for now.. 
-                if (!isa<GetElementPtrInst>(MyOp->stripPointerCasts())) 
+                if (!isa<GetElementPtrInst>(MyOp)) 
                 {
                     continue;
                 }
                 
-                GetElementPtrInst *GepOp= cast<GetElementPtrInst>(MyOp->stripPointerCasts()); 
-
+                GetElementPtrInst *GepOp= cast<GetElementPtrInst>(MyOp); 
                 if (isMissedGep(GepOp, Ins)) 
                 {
                     dbg(errs() << "!>ALERT: missed GepOp: " << *GepOp << " in " << *Ins \
@@ -1037,8 +1038,8 @@ namespace {
                     // an instruction uses V
                     dbg(errs() << "Use of old ptr: " << *userI << "\n";)
                     if (isa<LoadInst>(userI) || isa<StoreInst>(userI) ||
-                        isa<AtomicRMWInst>(userI) || isa<BitCastInst>(userI) ||
-                        isa<CallInst>(userI) || isa<InvokeInst>(userI))
+                        isa<AtomicRMWInst>(userI) || isa<BitCastInst>(userI))// ||
+                        // isa<CallInst>(userI) || isa<InvokeInst>(userI))
                     {
                         int OpIdx = getOpIdx(userI, Ptr);
                         if (OpIdx >= 0)
@@ -1182,8 +1183,8 @@ namespace {
                     // an instruction uses V
                     dbg(errs() << "Use of old ptr: " << *userI << "\n";)
                     if (isa<LoadInst>(userI) || isa<StoreInst>(userI) ||
-                        isa<AtomicRMWInst>(userI) || isa<BitCastInst>(userI) ||
-                        isa<CallInst>(userI) || isa<InvokeInst>(userI))
+                        isa<AtomicRMWInst>(userI) || isa<BitCastInst>(userI))// ||
+                        //isa<CallInst>(userI) || isa<InvokeInst>(userI))
                     {
                         int OpIdx = getOpIdx(userI, Ptr);
                         if (OpIdx >= 0)
@@ -1706,7 +1707,7 @@ namespace {
                     }
 
                     sucInst = getNextInst(Ins);
-                     
+                    
                     changed = replaceFoldedGepOp(Ins);
                     
                     if (isa<LoadInst>(Ins) || isa<StoreInst>(Ins)) 
