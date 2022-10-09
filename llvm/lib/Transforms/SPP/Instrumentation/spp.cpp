@@ -1520,7 +1520,7 @@ namespace {
                 Idx++;
             }
             dbg(errs() << "gep is never dereferenced (func " << Ptr->getParent()->getParent()->getName() << "):\n";)
-            Ptr->dump();
+            // Ptr->dump();
             assert(false);
             return 0;
         }
