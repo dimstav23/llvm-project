@@ -1619,6 +1619,12 @@ namespace {
                  * update the tag once and 
                  * propagate the output to the spotted GEPs
                  */
+                /* 
+                 * insert update tag and checkbound call for the max bound
+                 * and propagate the clean ptr to the ld/st while preserving 
+                 * the overflow bit
+                 * Thus, any upcoming load will trigger a fault
+                 */
                 Type *RetArgTy = Type::getInt8PtrTy(M->getContext());
                 Type *Arg2Ty = Type::getInt64Ty(M->getContext());
                 SmallVector <Type*, 2> tlist;
@@ -1647,10 +1653,7 @@ namespace {
                 CallInst *TagUpdated = B.CreateCall(hook, args);
                 TagUpdated->setDoesNotThrow(); //to avoid it getting converted to invoke
 
-                /* 
-                 * insert checkbound call for the max bound
-                 * and propagate the clean ptr to the ld/st
-                 */
+                
                 //preserve the tlist same as the previous call
                 hookfty = FunctionType::get(RetArgTy, tlist, false);
 

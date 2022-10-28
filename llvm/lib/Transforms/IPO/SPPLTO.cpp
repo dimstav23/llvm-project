@@ -1292,8 +1292,6 @@ SPPLTO::duplicateUpdateTags(Function *FN)
     DenseMap<Value*, DenseMap<Value*, Value*>> updatedVals;
     for (auto BB = FN->begin(); BB != FN->end(); ++BB) 
     {
-        // DenseMap<Value*, Value*> updatedVals;
-        // DenseMap<Value*, Value*> offsetVals;
         for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
         { 
             if (auto cb = dyn_cast<CallInst>(ins)) 
@@ -1310,7 +1308,6 @@ SPPLTO::duplicateUpdateTags(Function *FN)
                         if (updatedVals.find(ArgVal) == updatedVals.end()) 
                         {
                             updatedVals[ArgVal][Off] = cb;
-                            // offsetVals[ArgVal].push_back(Off);
                         }
                         else 
                         {
@@ -1633,7 +1630,6 @@ SPPLTO::duplicateTagUpdates(Function *FN)
                         if (updatedVals.find(ArgVal) == updatedVals.end()) 
                         {
                             updatedVals[ArgVal][Off] = cb;
-                            // offsetVals[ArgVal].push_back(Off);
                         }
                         else 
                         {
@@ -2077,7 +2073,6 @@ SPPLTO::redundantCB(Function *FN)
                                 //and remove the function call
                                 dbg(errs() << ">>InvokeInst ext or vol ptr -- should skip : " << *cb << " Uses: " \
                                             << cb->getNumUses() << " argval: " << *ArgVal << "\n";)
-                                // cb->replaceAllUsesWith(ArgVal);
 
                                 std::vector<User*> Users(ArgVal->user_begin(), ArgVal->user_end());
                                 for (auto User : Users) 
@@ -2097,8 +2092,6 @@ SPPLTO::redundantCB(Function *FN)
                                             break;
                                     }                      
                                 }
-
-                                // redundantChecks.push_back(cb);
                                 break;
                             }
                             else 
@@ -2167,12 +2160,6 @@ SPPLTO::runOnModule(Module &M)
     if (!M.getFunction("main")) 
     {
         dbg(errs() << "!>ALERT: No main found in module\n";)
-        // for (auto curFref = M.getFunctionList().begin(), 
-        //     endFref = M.getFunctionList().end(); 
-        //     curFref != endFref; ++curFref) {
-        //     errs() << ">>Found function: " << curFref->getName() << "\n";
-        // }
-        // return false; /// DON'T DELETE ME!!
     }
     
     setDL(&M.getDataLayout()); //init the data layout
@@ -2241,7 +2228,6 @@ SPPLTO::runOnModule(Module &M)
             dbg(errs() << ">>Func Name demangled : " << FName << "\n";)
         }
 
-        // errs() << *Fn << "\n";
         if (Fn->isDeclaration()) 
         {
             dbg(errs() << ">>declaration: skipping..\n";)
@@ -2265,8 +2251,6 @@ SPPLTO::runOnModule(Module &M)
 
         runOnFunction(&*Fn, M);
     }
-
-    // errs() << M << "\n";
     
     int postProcessedInst;
     do {
@@ -2339,83 +2323,6 @@ SPPLTO::runOnModule(Module &M)
 
         dbg(errs() << "post processed inst: " << postProcessedInst << "\n";)
     } while(postProcessedInst!=0);
-
-    // if (!isFirstLTO)
-    // {
-    //     for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
-    //     { 
-    //         int cnt = 0;
-    //         for (auto BB = Fn->begin(); BB != Fn->end(); ++BB) 
-    //         {
-    //             for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
-    //             {
-    //                 if (auto cb = dyn_cast<CallBase>(ins)) 
-    //                 {
-    //                     Function *cfn= dyn_cast<Function>(cb->getCalledOperand()->stripPointerCasts());
-    //                     if (cfn) 
-    //                     {
-    //                         StringRef fname = cfn->getName();
-    //                         if (fname.contains("__spp_checkbound") ||
-    //                             fname.contains("__spp_update_check"))
-    //                             cnt++;
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //         errs() << Fn->getName() << " checkbounds : " << cnt << "\n";
-    //     }
-    // }
-
-    // if (!isFirstLTO)
-    // {
-    //     int check_idx=1;
-    //     for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
-    //     { 
-    //         for (auto BB = Fn->begin(); BB != Fn->end(); ++BB) 
-    //         {
-    //             BasicBlock *BaB = &*BB;
-    //             for (auto ins = BB->begin(); ins != BB->end(); ++ins ) 
-    //             {
-    //                 if (auto cb = dyn_cast<CallBase>(ins)) 
-    //                 {
-    //                     Function* CalleeF = cb->getCalledFunction();
-    //                     if (CalleeF) 
-    //                     {
-    //                         StringRef fname = CalleeF->getName();
-    //                         if (fname.contains("__spp_checkbound"))
-    //                         {
-    //                             // StringRef S = StringRef((Fn->getName()+"_"+Twine(check_idx)).str());
-    //                             StringRef S = StringRef(std::to_string(check_idx));
-    //                             insertPrint(BaB, cb, S);
-    //                             check_idx++;
-    //                         }
-    //                         else if (fname.contains("__spp_update_check_clean"))
-    //                         {
-    //                             // StringRef S = StringRef((Fn->getName()+"_"+Twine(check_idx)).str());
-    //                             StringRef S = StringRef(std::to_string(check_idx));
-    //                             insertPrint(BaB, cb, S);
-    //                             check_idx++;
-    //                         }
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //     }
-    // }
-    
-    // for (auto Fn = M.begin(); Fn != M.end(); ++Fn) 
-    // {
-    //     for (auto BB = Fn->begin(); BB != Fn->end(); ++BB) 
-    //     {
-    //         BasicBlock *BaB = &*BB; 
-    //         if (BaB == &BaB->getParent()->getEntryBlock())
-    //             errs() << *Fn <<"\n";
-    //         errs() << *BB << "\n";
-    //     }
-    // }
-
-    // if (!isFirstLTO)
-    //     errs() << M << "\n";
 
     memCleanUp();
 
